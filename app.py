@@ -16,68 +16,116 @@ from pydantic import BaseModel, Field
 API_KEY = os.environ.get("API_KEY", "change-me")
 
 app = FastAPI(
-    title="Shrimp AI Dashboard",
-    version="2.0"
+    title="Shrimp Sorting AI Dashboard",
+    version="4.0.0"
 )
 
 
 # =========================================================
-# DATA
+# ประเภทกุ้งทั้งหมดในระบบ
 # =========================================================
 
-# ผลรอบล่าสุด
+SHRIMP_TYPES = [
+    "กุ้งเล็ก",
+    "กุ้งกลาง",
+    "กุ้งใหญ่",
+    "กุ้งป่วย"
+]
+
+
+# =========================================================
+# DATA STORAGE
+# =========================================================
+
+# ผลการทำงานรอบล่าสุด
 latest_round = None
 
 # เก็บประวัติสูงสุด 100 รอบ
 round_history = deque(maxlen=100)
 
-# ภาพล่าสุดจากกล้อง
+# ภาพกล้องล่าสุด
 live_frame = None
-live_ts = 0
+live_ts = 0.0
 
 
 # =========================================================
-# MODEL
+# DATA MODEL
 # =========================================================
 
 class RoundReport(BaseModel):
 
-    # เลขรอบ เช่น 1, 2, 3
+    # หมายเลขรอบ
     round_id: int = 0
 
-    # จำนวนกุ้งแต่ละชนิด
-    counts: dict[str, int] = Field(default_factory=dict)
+    # จำนวนกุ้งแต่ละประเภท
+    counts: dict[str, int] = Field(
+        default_factory=dict
+    )
 
-    # FPS เฉลี่ย
+    # FPS เฉลี่ยของ AI
     avg_fps: float = 0.0
 
-    # เวลาที่ใช้ในการตรวจ
+    # เวลาที่ใช้ในการทำงานรอบนั้น
     duration: float = 0.0
 
     # จำนวนเฟรมที่ตรวจ
     frames: int = 0
 
-    # เวลาที่เริ่มรอบ
+    # เวลาเริ่ม
     started_at: str | None = None
 
-    # เวลาที่จบรอบ
+    # เวลาจบ
     finished_at: str | None = None
 
-    # ภาพจาก AI
+    # ภาพผลลัพธ์ล่าสุด
     frame_b64: str | None = None
 
 
 class LiveReport(BaseModel):
 
-    counts: dict[str, int] = Field(default_factory=dict)
+    # จำนวนที่ AI เห็น ณ ตอนนั้น
+    counts: dict[str, int] = Field(
+        default_factory=dict
+    )
 
+    # FPS
     fps: float = 0.0
 
+    # ภาพจากกล้อง
     frame_b64: str | None = None
 
 
 # =========================================================
-# RECEIVE COMPLETED ROUND
+# CLEAN COUNTS
+# =========================================================
+
+def clean_counts(raw_counts):
+
+    result = {}
+
+    # บังคับให้มี 4 ประเภทเสมอ
+    for shrimp_type in SHRIMP_TYPES:
+
+        value = raw_counts.get(
+            shrimp_type,
+            0
+        )
+
+        try:
+            value = int(value)
+        except Exception:
+            value = 0
+
+        if value < 0:
+            value = 0
+
+        result[shrimp_type] = value
+
+    return result
+
+
+# =========================================================
+# RECEIVE RESULT WHEN ROUND FINISHES
 # =========================================================
 
 @app.post("/api/round")
@@ -102,55 +150,75 @@ def receive_round(
         )
 
     # -------------------------
-    # ทำความสะอาดข้อมูล
+    # จัดข้อมูลจำนวนกุ้ง
     # -------------------------
 
-    clean_counts = {}
-
-    for name, value in data.counts.items():
-
-        try:
-            value = int(value)
-        except Exception:
-            value = 0
-
-        if value < 0:
-            value = 0
-
-        clean_counts[str(name)] = value
+    counts = clean_counts(
+        data.counts
+    )
 
     # -------------------------
-    # รวมทั้งหมด
+    # รวมกุ้งทั้งหมด
     # -------------------------
 
-    total = sum(clean_counts.values())
+    total = sum(
+        counts.values()
+    )
 
     # -------------------------
-    # สร้างข้อมูลรอบ
+    # จำนวนกุ้งปกติ
+    # -------------------------
+
+    normal_total = (
+        counts["กุ้งเล็ก"]
+        + counts["กุ้งกลาง"]
+        + counts["กุ้งใหญ่"]
+    )
+
+    # -------------------------
+    # สร้างผลรอบ
     # -------------------------
 
     result = {
 
-        "round_id": data.round_id,
+        "round_id":
+            int(data.round_id),
 
-        "counts": clean_counts,
+        "counts":
+            counts,
 
-        "total": total,
+        "total":
+            total,
 
-        "avg_fps": round(
-            max(0, float(data.avg_fps)),
-            2
-        ),
+        "normal_total":
+            normal_total,
 
-        "duration": round(
-            max(0, float(data.duration)),
-            2
-        ),
+        "sick_total":
+            counts["กุ้งป่วย"],
 
-        "frames": max(
-            0,
-            int(data.frames)
-        ),
+        "avg_fps":
+            round(
+                max(
+                    0,
+                    float(data.avg_fps)
+                ),
+                2
+            ),
+
+        "duration":
+            round(
+                max(
+                    0,
+                    float(data.duration)
+                ),
+                2
+            ),
+
+        "frames":
+            max(
+                0,
+                int(data.frames)
+            ),
 
         "started_at":
             data.started_at,
@@ -163,15 +231,21 @@ def receive_round(
     }
 
     # -------------------------
-    # บันทึก
+    # บันทึกผลรอบล่าสุด
     # -------------------------
 
     latest_round = result
 
-    round_history.appendleft(result)
+    # -------------------------
+    # เพิ่มลงประวัติ
+    # -------------------------
+
+    round_history.appendleft(
+        result
+    )
 
     # -------------------------
-    # ถ้ามีภาพให้เก็บไว้ด้วย
+    # ถ้ามีภาพ
     # -------------------------
 
     if data.frame_b64:
@@ -196,9 +270,14 @@ def receive_round(
         "round_id":
             data.round_id,
 
-        "total":
-            total
+        "counts":
+            counts,
 
+        "total":
+            total,
+
+        "sick":
+            counts["กุ้งป่วย"]
     }
 
 
@@ -222,6 +301,7 @@ def receive_live(
             detail="Invalid API key"
         )
 
+    # รับภาพจาก AI
     if data.frame_b64:
 
         try:
@@ -246,7 +326,7 @@ def receive_live(
 
 
 # =========================================================
-# DASHBOARD DATA
+# DASHBOARD API
 # =========================================================
 
 @app.get("/api/dashboard")
@@ -261,8 +341,10 @@ def dashboard():
             latest_round,
 
         "history":
-            list(round_history)
+            list(round_history),
 
+        "shrimp_types":
+            SHRIMP_TYPES
     }
 
 
@@ -276,11 +358,19 @@ def live_status():
     if live_ts == 0:
 
         return {
+
             "online": False,
-            "age": 0
+
+            "age": 0,
+
+            "has_frame": False
+
         }
 
-    age = time.time() - live_ts
+    age = (
+        time.time()
+        - live_ts
+    )
 
     return {
 
@@ -317,7 +407,7 @@ def get_live_frame():
 
         headers={
             "Cache-Control":
-                "no-store"
+                "no-store, no-cache, must-revalidate"
         }
 
     )
@@ -325,6 +415,7 @@ def get_live_frame():
 
 # =========================================================
 # PAGE 1
+# DASHBOARD
 # =========================================================
 
 DASHBOARD_PAGE = r"""
@@ -337,323 +428,694 @@ DASHBOARD_PAGE = r"""
 <meta charset="UTF-8">
 
 <meta
-name="viewport"
-content="width=device-width,initial-scale=1"
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
 >
 
-<title>สรุปผลการตรวจจับกุ้ง</title>
+<title>ระบบคัดแยกกุ้ง AI</title>
 
 <style>
 
-*{
-    box-sizing:border-box;
+* {
+    box-sizing: border-box;
 }
 
-body{
+body {
 
-    margin:0;
+    margin: 0;
 
-    background:#07111c;
+    background: #f5f9fc;
 
-    color:#e8f2f8;
+    color: #183247;
 
     font-family:
         "Noto Sans Thai",
+        "Segoe UI",
         Arial,
         sans-serif;
 }
 
 
-/* HEADER */
+/* =====================================================
+   HEADER
+===================================================== */
 
-header{
+header {
 
-    padding:20px 30px;
-
-    background:
-        linear-gradient(
-            135deg,
-            #064e3b,
-            #075985,
-            #172554
-        );
-
-    display:flex;
-
-    align-items:center;
-
-    justify-content:space-between;
-
-    gap:15px;
-
-    flex-wrap:wrap;
-}
-
-h1{
-
-    margin:0;
-
-    font-size:24px;
-}
-
-.subtitle{
-
-    color:#a9c5d6;
-
-    margin-top:4px;
-
-    font-size:13px;
-}
-
-
-/* NAV */
-
-nav{
-
-    display:flex;
-
-    gap:8px;
-}
-
-nav a{
-
-    color:#dbeafe;
-
-    text-decoration:none;
-
-    padding:9px 15px;
-
-    border-radius:9px;
-
-    background:
-        rgba(255,255,255,.10);
-}
-
-nav a.active{
-
-    background:#f97316;
-
-    color:white;
-}
-
-
-/* MAIN */
-
-main{
-
-    width:min(1200px,94%);
-
-    margin:25px auto;
-}
-
-
-/* CARDS */
-
-.cards{
-
-    display:grid;
-
-    grid-template-columns:
-        repeat(4,1fr);
-
-    gap:15px;
-}
-
-.card{
-
-    background:#0e2030;
-
-    border:1px solid #1b3549;
-
-    border-radius:15px;
-
-    padding:20px;
-}
-
-.card-title{
-
-    color:#8eacbe;
-
-    font-size:13px;
-}
-
-.number{
-
-    margin-top:10px;
-
-    font-size:32px;
-
-    font-weight:800;
-
-    color:#fb923c;
-}
-
-
-/* LATEST */
-
-.latest{
-
-    margin-top:18px;
-}
-
-.latest-header{
-
-    display:flex;
-
-    justify-content:space-between;
-
-    align-items:center;
-
-    margin-bottom:15px;
-}
-
-.latest-header h2{
-
-    margin:0;
-
-    font-size:18px;
-}
-
-.badge{
-
-    background:#123b32;
-
-    color:#86efac;
-
-    padding:6px 12px;
-
-    border-radius:20px;
-
-    font-size:12px;
-}
-
-
-/* SPECIES */
-
-.species{
-
-    display:grid;
-
-    grid-template-columns:
-        repeat(auto-fit,minmax(160px,1fr));
-
-    gap:10px;
-
-    margin-top:15px;
-}
-
-.species-item{
-
-    background:#091a28;
-
-    border:1px solid #173247;
-
-    border-radius:10px;
-
-    padding:14px;
-
-}
-
-.species-name{
-
-    color:#9bb7c7;
-
-    font-size:13px;
-}
-
-.species-value{
-
-    font-size:24px;
-
-    font-weight:bold;
-
-    color:#fb923c;
-
-    margin-top:5px;
-}
-
-
-/* TABLE */
-
-.history{
-
-    margin-top:18px;
-}
-
-.table-wrap{
-
-    overflow:auto;
-}
-
-table{
-
-    width:100%;
-
-    border-collapse:collapse;
-
-    min-width:650px;
-}
-
-th,td{
-
-    padding:13px;
-
-    text-align:left;
+    background: #ffffff;
 
     border-bottom:
-        1px solid #193449;
+        1px solid #dbeaf2;
+
+    padding: 18px 30px;
+
+    display: flex;
+
+    align-items: center;
+
+    justify-content: space-between;
+
+    gap: 20px;
+
+    flex-wrap: wrap;
+
+    box-shadow:
+        0 3px 15px
+        rgba(40,90,120,.08);
 }
 
-th{
+.logo {
 
-    color:#8faabb;
+    display: flex;
 
-    font-size:12px;
+    align-items: center;
+
+    gap: 13px;
 }
 
-td{
+.logo-icon {
 
-    font-size:13px;
+    width: 52px;
+
+    height: 52px;
+
+    border-radius: 15px;
+
+    background: #e6f7ff;
+
+    border: 1px solid #ccecf8;
+
+    display: flex;
+
+    align-items: center;
+
+    justify-content: center;
+
+    font-size: 28px;
 }
 
-.empty{
+.logo h1 {
 
-    text-align:center;
+    margin: 0;
 
-    color:#668398;
+    font-size: 22px;
 
-    padding:50px 10px;
+    color: #16435d;
+}
+
+.logo p {
+
+    margin: 4px 0 0;
+
+    color: #78909c;
+
+    font-size: 12px;
 }
 
 
-/* RESPONSIVE */
+/* =====================================================
+   NAV
+===================================================== */
 
-@media(max-width:900px){
+nav {
 
-    .cards{
+    display: flex;
+
+    gap: 8px;
+}
+
+nav a {
+
+    text-decoration: none;
+
+    color: #506b7a;
+
+    background: #ffffff;
+
+    border: 1px solid #d5e5ed;
+
+    padding: 9px 15px;
+
+    border-radius: 9px;
+
+    font-size: 13px;
+
+    transition: .2s;
+}
+
+nav a:hover {
+
+    background: #effaff;
+
+    border-color: #9dd8ef;
+}
+
+nav a.active {
+
+    color: #ffffff;
+
+    background: #0ea5e9;
+
+    border-color: #0ea5e9;
+}
+
+
+/* =====================================================
+   MAIN
+===================================================== */
+
+main {
+
+    width: min(1200px, 94%);
+
+    margin: 25px auto 40px;
+}
+
+
+/* =====================================================
+   STAT CARDS
+===================================================== */
+
+.stats {
+
+    display: grid;
+
+    grid-template-columns:
+        repeat(4, 1fr);
+
+    gap: 15px;
+}
+
+.stat {
+
+    background: #ffffff;
+
+    border: 1px solid #dceaf1;
+
+    border-radius: 16px;
+
+    padding: 20px;
+
+    box-shadow:
+        0 5px 18px
+        rgba(50,100,130,.07);
+}
+
+.stat-title {
+
+    color: #78909e;
+
+    font-size: 13px;
+}
+
+.stat-number {
+
+    margin-top: 8px;
+
+    font-size: 32px;
+
+    font-weight: 800;
+
+    color: #f97316;
+}
+
+.stat-unit {
+
+    color: #9aabb5;
+
+    font-size: 12px;
+}
+
+
+/* =====================================================
+   SECTION
+===================================================== */
+
+.section-title {
+
+    margin: 22px 0 12px;
+
+    font-size: 18px;
+
+    font-weight: 700;
+
+    color: #234b62;
+}
+
+
+/* =====================================================
+   SHRIMP CARDS
+===================================================== */
+
+.shrimp-cards {
+
+    display: grid;
+
+    grid-template-columns:
+        repeat(4, 1fr);
+
+    gap: 15px;
+}
+
+.shrimp-card {
+
+    background: #ffffff;
+
+    border-radius: 16px;
+
+    padding: 20px;
+
+    border: 1px solid #dceaf1;
+
+    box-shadow:
+        0 5px 18px
+        rgba(50,100,130,.07);
+
+    position: relative;
+
+    overflow: hidden;
+}
+
+.shrimp-card::before {
+
+    content: "";
+
+    position: absolute;
+
+    left: 0;
+
+    top: 0;
+
+    width: 5px;
+
+    height: 100%;
+}
+
+.small::before {
+
+    background: #22c55e;
+}
+
+.medium::before {
+
+    background: #0ea5e9;
+}
+
+.large::before {
+
+    background: #f97316;
+}
+
+.sick::before {
+
+    background: #ef4444;
+}
+
+.shrimp-top {
+
+    display: flex;
+
+    justify-content: space-between;
+
+    align-items: center;
+}
+
+.shrimp-name {
+
+    font-weight: 700;
+
+    color: #31576b;
+}
+
+.shrimp-icon {
+
+    font-size: 26px;
+}
+
+.shrimp-number {
+
+    margin-top: 10px;
+
+    font-size: 34px;
+
+    font-weight: 800;
+}
+
+.small .shrimp-number {
+
+    color: #16a34a;
+}
+
+.medium .shrimp-number {
+
+    color: #0284c7;
+}
+
+.large .shrimp-number {
+
+    color: #ea580c;
+}
+
+.sick .shrimp-number {
+
+    color: #dc2626;
+}
+
+.percent {
+
+    margin-top: 4px;
+
+    color: #8196a2;
+
+    font-size: 12px;
+}
+
+
+/* =====================================================
+   PANEL
+===================================================== */
+
+.panel {
+
+    background: #ffffff;
+
+    border: 1px solid #dceaf1;
+
+    border-radius: 16px;
+
+    margin-top: 18px;
+
+    padding: 20px;
+
+    box-shadow:
+        0 5px 18px
+        rgba(50,100,130,.07);
+}
+
+.panel-header {
+
+    display: flex;
+
+    align-items: center;
+
+    justify-content: space-between;
+
+    gap: 10px;
+
+    margin-bottom: 15px;
+}
+
+.panel-header h2 {
+
+    margin: 0;
+
+    font-size: 18px;
+
+    color: #234b62;
+}
+
+.badge {
+
+    padding: 6px 12px;
+
+    border-radius: 20px;
+
+    background: #eaf8ef;
+
+    color: #15803d;
+
+    font-size: 12px;
+
+    font-weight: 600;
+}
+
+
+/* =====================================================
+   DETAIL
+===================================================== */
+
+.details {
+
+    display: grid;
+
+    grid-template-columns:
+        repeat(4, 1fr);
+
+    gap: 10px;
+}
+
+.detail {
+
+    padding: 13px;
+
+    border-radius: 10px;
+
+    background: #f7fafc;
+
+    border: 1px solid #e4eef3;
+}
+
+.detail-label {
+
+    color: #8398a4;
+
+    font-size: 11px;
+}
+
+.detail-value {
+
+    margin-top: 5px;
+
+    color: #31576b;
+
+    font-weight: 700;
+
+    font-size: 15px;
+}
+
+
+/* =====================================================
+   BAR CHART
+===================================================== */
+
+.chart-row {
+
+    margin-top: 16px;
+}
+
+.chart-label {
+
+    display: flex;
+
+    justify-content: space-between;
+
+    margin-bottom: 6px;
+
+    font-size: 13px;
+
+    color: #506b7a;
+}
+
+.bar-bg {
+
+    width: 100%;
+
+    height: 13px;
+
+    background: #edf3f6;
+
+    border-radius: 20px;
+
+    overflow: hidden;
+}
+
+.bar {
+
+    height: 100%;
+
+    border-radius: 20px;
+
+    transition:
+        width .5s ease;
+}
+
+.bar-small {
+
+    background: #22c55e;
+}
+
+.bar-medium {
+
+    background: #0ea5e9;
+}
+
+.bar-large {
+
+    background: #f97316;
+}
+
+.bar-sick {
+
+    background: #ef4444;
+}
+
+
+/* =====================================================
+   HISTORY TABLE
+===================================================== */
+
+.table-wrap {
+
+    width: 100%;
+
+    overflow-x: auto;
+}
+
+table {
+
+    width: 100%;
+
+    min-width: 850px;
+
+    border-collapse: collapse;
+}
+
+th {
+
+    padding: 13px;
+
+    text-align: left;
+
+    background: #f3f8fb;
+
+    color: #67818f;
+
+    font-size: 12px;
+
+    border-bottom:
+        1px solid #dceaf1;
+}
+
+td {
+
+    padding: 13px;
+
+    color: #506b7a;
+
+    font-size: 13px;
+
+    border-bottom:
+        1px solid #edf2f5;
+}
+
+tr:hover td {
+
+    background: #f9fcfe;
+}
+
+.round {
+
+    color: #0284c7;
+
+    font-weight: 700;
+}
+
+.total {
+
+    color: #ea580c;
+
+    font-weight: 800;
+}
+
+.sick-value {
+
+    color: #dc2626;
+
+    font-weight: 700;
+}
+
+.empty {
+
+    text-align: center;
+
+    color: #94a8b3;
+
+    padding: 45px;
+}
+
+
+/* =====================================================
+   FOOTER
+===================================================== */
+
+footer {
+
+    text-align: center;
+
+    color: #8ba0ab;
+
+    font-size: 12px;
+
+    padding: 5px 0 35px;
+}
+
+
+/* =====================================================
+   RESPONSIVE
+===================================================== */
+
+@media(max-width:1000px) {
+
+    .stats {
 
         grid-template-columns:
-            repeat(2,1fr);
+            repeat(2, 1fr);
+    }
+
+    .shrimp-cards {
+
+        grid-template-columns:
+            repeat(2, 1fr);
+    }
+
+    .details {
+
+        grid-template-columns:
+            repeat(2, 1fr);
     }
 }
 
-@media(max-width:550px){
+@media(max-width:600px) {
 
-    .cards{
+    header {
 
-        grid-template-columns:1fr;
+        padding: 15px;
     }
 
-    header{
+    .stats {
 
-        padding:18px;
+        grid-template-columns: 1fr;
     }
 
-    h1{
+    .shrimp-cards {
 
-        font-size:20px;
+        grid-template-columns: 1fr;
     }
 
+    .details {
+
+        grid-template-columns: 1fr;
+    }
+
+    .logo h1 {
+
+        font-size: 18px;
+    }
+
+    main {
+
+        width: 94%;
+    }
 }
 
 </style>
@@ -664,14 +1126,28 @@ td{
 <body>
 
 
+<!-- =====================================================
+     HEADER
+===================================================== -->
+
 <header>
+
+<div class="logo">
+
+<div class="logo-icon">
+🦐
+</div>
 
 <div>
 
-<h1>🦐 ระบบสรุปผลการตรวจจับกุ้ง AI</h1>
+<h1>
+ระบบคัดแยกกุ้ง AI
+</h1>
 
-<div class="subtitle">
-ผลการทำงานของ AI แยกตามรอบ
+<p>
+Shrimp Size Sorting & Health Detection
+</p>
+
 </div>
 
 </div>
@@ -687,7 +1163,7 @@ class="active"
 </a>
 
 <a href="/live">
-📷 กล้อง Live
+📷 กล้อง Real-time
 </a>
 
 </nav>
@@ -698,68 +1174,325 @@ class="active"
 <main>
 
 
-<!-- STATS -->
+<!-- =====================================================
+     TOP STATISTICS
+===================================================== -->
 
-<div class="cards">
+<div class="stats">
 
 
-<div class="card">
+<div class="stat">
 
-<div class="card-title">
+<div class="stat-title">
 รอบล่าสุด
 </div>
 
 <div
 id="round"
-class="number"
+class="stat-number"
 >
 -
 </div>
 
+<div class="stat-unit">
+รอบการคัด
+</div>
+
 </div>
 
 
-<div class="card">
+<div class="stat">
 
-<div class="card-title">
-กุ้งในรอบล่าสุด
+<div class="stat-title">
+กุ้งทั้งหมด
 </div>
 
 <div
 id="total"
-class="number"
+class="stat-number"
 >
 -
 </div>
 
+<div class="stat-unit">
+ตัว
+</div>
+
 </div>
 
 
-<div class="card">
+<div class="stat">
 
-<div class="card-title">
+<div class="stat-title">
 FPS เฉลี่ย
 </div>
 
 <div
 id="fps"
-class="number"
+class="stat-number"
 >
 -
 </div>
 
+<div class="stat-unit">
+Frames / Second
+</div>
+
 </div>
 
 
-<div class="card">
+<div class="stat">
 
-<div class="card-title">
+<div class="stat-title">
 เวลาทำงาน
 </div>
 
 <div
 id="duration"
-class="number"
+class="stat-number"
+>
+-
+</div>
+
+<div class="stat-unit">
+วินาที
+</div>
+
+</div>
+
+
+</div>
+
+
+<!-- =====================================================
+     SHRIMP TYPES
+===================================================== -->
+
+<div class="section-title">
+🦐 ผลการคัดแยกกุ้ง
+</div>
+
+
+<div class="shrimp-cards">
+
+
+<!-- SMALL -->
+
+<div class="shrimp-card small">
+
+<div class="shrimp-top">
+
+<div class="shrimp-name">
+กุ้งเล็ก
+</div>
+
+<div class="shrimp-icon">
+🦐
+</div>
+
+</div>
+
+<div
+id="smallCount"
+class="shrimp-number"
+>
+0
+</div>
+
+<div
+id="smallPercent"
+class="percent"
+>
+0% ของทั้งหมด
+</div>
+
+</div>
+
+
+<!-- MEDIUM -->
+
+<div class="shrimp-card medium">
+
+<div class="shrimp-top">
+
+<div class="shrimp-name">
+กุ้งกลาง
+</div>
+
+<div class="shrimp-icon">
+🦐
+</div>
+
+</div>
+
+<div
+id="mediumCount"
+class="shrimp-number"
+>
+0
+</div>
+
+<div
+id="mediumPercent"
+class="percent"
+>
+0% ของทั้งหมด
+</div>
+
+</div>
+
+
+<!-- LARGE -->
+
+<div class="shrimp-card large">
+
+<div class="shrimp-top">
+
+<div class="shrimp-name">
+กุ้งใหญ่
+</div>
+
+<div class="shrimp-icon">
+🦐
+</div>
+
+</div>
+
+<div
+id="largeCount"
+class="shrimp-number"
+>
+0
+</div>
+
+<div
+id="largePercent"
+class="percent"
+>
+0% ของทั้งหมด
+</div>
+
+</div>
+
+
+<!-- SICK -->
+
+<div class="shrimp-card sick">
+
+<div class="shrimp-top">
+
+<div class="shrimp-name">
+กุ้งป่วย
+</div>
+
+<div class="shrimp-icon">
+🩺
+</div>
+
+</div>
+
+<div
+id="sickCount"
+class="shrimp-number"
+>
+0
+</div>
+
+<div
+id="sickPercent"
+class="percent"
+>
+0% ของทั้งหมด
+</div>
+
+</div>
+
+
+</div>
+
+
+<!-- =====================================================
+     LATEST ROUND
+===================================================== -->
+
+<div class="panel">
+
+<div class="panel-header">
+
+<h2>
+📋 สรุปผลรอบล่าสุด
+</h2>
+
+<div
+id="badge"
+class="badge"
+>
+รอข้อมูลจาก AI
+</div>
+
+</div>
+
+
+<div class="details">
+
+
+<div class="detail">
+
+<div class="detail-label">
+หมายเลขรอบ
+</div>
+
+<div
+id="detailRound"
+class="detail-value"
+>
+-
+</div>
+
+</div>
+
+
+<div class="detail">
+
+<div class="detail-label">
+จำนวนเฟรม
+</div>
+
+<div
+id="frames"
+class="detail-value"
+>
+-
+</div>
+
+</div>
+
+
+<div class="detail">
+
+<div class="detail-label">
+เวลาเริ่ม
+</div>
+
+<div
+id="started"
+class="detail-value"
+>
+-
+</div>
+
+</div>
+
+
+<div class="detail">
+
+<div class="detail-label">
+เวลาจบ
+</div>
+
+<div
+id="finished"
+class="detail-value"
 >
 -
 </div>
@@ -770,49 +1503,135 @@ class="number"
 </div>
 
 
-<!-- LATEST ROUND -->
+<!-- =====================================================
+     BAR CHART
+===================================================== -->
 
-<div class="card latest">
+<div class="chart-row">
 
-<div class="latest-header">
+<div class="chart-label">
 
-<h2>
-📋 ผลสรุปรอบล่าสุด
-</h2>
-
-<span
-class="badge"
-id="finished"
->
-ยังไม่มีข้อมูล
+<span>
+🟢 กุ้งเล็ก
 </span>
 
+<b id="smallBarText">
+0 ตัว
+</b>
+
 </div>
 
+<div class="bar-bg">
 
 <div
-id="species"
-class="species"
+id="smallBar"
+class="bar bar-small"
+style="width:0%"
 >
-
-<div class="empty">
-รอ AI ส่งผลการทำงานรอบแรก
 </div>
 
 </div>
 
+</div>
+
+
+<div class="chart-row">
+
+<div class="chart-label">
+
+<span>
+🔵 กุ้งกลาง
+</span>
+
+<b id="mediumBarText">
+0 ตัว
+</b>
+
+</div>
+
+<div class="bar-bg">
+
+<div
+id="mediumBar"
+class="bar bar-medium"
+style="width:0%"
+>
+</div>
+
+</div>
 
 </div>
 
 
-<!-- HISTORY -->
+<div class="chart-row">
 
-<div class="card history">
+<div class="chart-label">
 
-<div class="latest-header">
+<span>
+🟠 กุ้งใหญ่
+</span>
+
+<b id="largeBarText">
+0 ตัว
+</b>
+
+</div>
+
+<div class="bar-bg">
+
+<div
+id="largeBar"
+class="bar bar-large"
+style="width:0%"
+>
+</div>
+
+</div>
+
+</div>
+
+
+<div class="chart-row">
+
+<div class="chart-label">
+
+<span>
+🔴 กุ้งป่วย
+</span>
+
+<b id="sickBarText">
+0 ตัว
+</b>
+
+</div>
+
+<div class="bar-bg">
+
+<div
+id="sickBar"
+class="bar bar-sick"
+style="width:0%"
+>
+</div>
+
+</div>
+
+</div>
+
+
+</div>
+
+
+<!-- =====================================================
+     HISTORY
+===================================================== -->
+
+<div class="panel">
+
+<div class="panel-header">
 
 <h2>
-📚 ประวัติการทำงาน
+📚 ประวัติการคัดกุ้ง
 </h2>
 
 </div>
@@ -826,33 +1645,52 @@ class="species"
 
 <tr>
 
-<th>รอบ</th>
+<th>
+รอบ
+</th>
 
-<th>จำนวนกุ้ง</th>
+<th>
+กุ้งเล็ก
+</th>
 
-<th>FPS</th>
+<th>
+กุ้งกลาง
+</th>
 
-<th>เวลา</th>
+<th>
+กุ้งใหญ่
+</th>
 
-<th>จำนวนเฟรม</th>
+<th>
+กุ้งป่วย
+</th>
 
-<th>เวลาจบ</th>
+<th>
+รวม
+</th>
+
+<th>
+FPS
+</th>
+
+<th>
+เวลา
+</th>
 
 </tr>
 
 </thead>
 
-<tbody
-id="history"
->
+
+<tbody id="history">
 
 <tr>
 
 <td
-colspan="6"
+colspan="8"
 class="empty"
 >
-ยังไม่มีประวัติ
+ยังไม่มีข้อมูลจาก AI
 </td>
 
 </tr>
@@ -869,62 +1707,97 @@ class="empty"
 </main>
 
 
+<footer>
+
+🦐 Shrimp AI Sorting System
+
+</footer>
+
+
 <script>
 
 
-function esc(value){
+// =========================================================
+// HTML ESCAPE
+// =========================================================
+
+function esc(value) {
 
     return String(value)
         .replace(
             /[&<>"']/g,
-            c => ({
-                "&":"&amp;",
-                "<":"&lt;",
-                ">":"&gt;",
-                '"':"&quot;",
-                "'":"&#039;"
-            }[c])
+            function(c) {
+
+                return {
+                    "&": "&amp;",
+                    "<": "&lt;",
+                    ">": "&gt;",
+                    '"': "&quot;",
+                    "'": "&#039;"
+                }[c];
+
+            }
         );
 
 }
 
 
-function formatTime(value){
+// =========================================================
+// PERCENT
+// =========================================================
 
-    if(!value)
-        return "-";
+function getPercent(
+    value,
+    total
+) {
 
-    return value;
+    if (total <= 0) {
+
+        return 0;
+
+    }
+
+    return (
+        value / total * 100
+    ).toFixed(1);
 
 }
 
 
-async function load(){
+// =========================================================
+// UPDATE DASHBOARD
+// =========================================================
 
-    try{
+async function updateDashboard() {
 
-        const res =
+    try {
+
+        const response =
             await fetch(
                 "/api/dashboard",
                 {
-                    cache:"no-store"
+                    cache: "no-store"
                 }
             );
 
         const data =
-            await res.json();
-
+            await response.json();
 
         const latest =
             data.latest;
 
 
-        if(!latest){
+        // ไม่มีรอบ
+        if (!latest) {
 
             return;
 
         }
 
+
+        // =================================================
+        // BASIC
+        // =================================================
 
         document
             .getElementById("round")
@@ -947,62 +1820,217 @@ async function load(){
         document
             .getElementById("duration")
             .textContent =
-                latest.duration + "s";
+                latest.duration;
+
+
+        document
+            .getElementById("detailRound")
+            .textContent =
+                "#" + latest.round_id;
+
+
+        document
+            .getElementById("frames")
+            .textContent =
+                latest.frames;
+
+
+        document
+            .getElementById("started")
+            .textContent =
+                latest.started_at || "-";
 
 
         document
             .getElementById("finished")
             .textContent =
-                latest.finished_at || "เสร็จแล้ว";
+                latest.finished_at || "-";
 
 
-        /* SPECIES */
+        document
+            .getElementById("badge")
+            .textContent =
+                "✓ AI ส่งผลแล้ว";
 
-        const species =
-            document.getElementById(
-                "species"
+
+        // =================================================
+        // COUNTS
+        // =================================================
+
+        const counts =
+            latest.counts || {};
+
+
+        const small =
+            Number(
+                counts["กุ้งเล็ก"] || 0
             );
 
 
-        const entries =
-            Object.entries(
-                latest.counts || {}
+        const medium =
+            Number(
+                counts["กุ้งกลาง"] || 0
             );
 
 
-        if(!entries.length){
-
-            species.innerHTML = `
-                <div class="empty">
-                    รอบนี้ไม่พบกุ้ง
-                </div>
-            `;
-
-        }else{
-
-            species.innerHTML =
-                entries.map(
-                    ([name,value]) => `
-
-                    <div class="species-item">
-
-                        <div class="species-name">
-                            🦐 ${esc(name)}
-                        </div>
-
-                        <div class="species-value">
-                            ${value} ตัว
-                        </div>
-
-                    </div>
-
-                    `
-                ).join("");
-
-        }
+        const large =
+            Number(
+                counts["กุ้งใหญ่"] || 0
+            );
 
 
-        /* HISTORY */
+        const sick =
+            Number(
+                counts["กุ้งป่วย"] || 0
+            );
+
+
+        const total =
+            small +
+            medium +
+            large +
+            sick;
+
+
+        // =================================================
+        // CARDS
+        // =================================================
+
+        document
+            .getElementById("smallCount")
+            .textContent =
+                small;
+
+
+        document
+            .getElementById("mediumCount")
+            .textContent =
+                medium;
+
+
+        document
+            .getElementById("largeCount")
+            .textContent =
+                large;
+
+
+        document
+            .getElementById("sickCount")
+            .textContent =
+                sick;
+
+
+        // =================================================
+        // PERCENT
+        // =================================================
+
+        document
+            .getElementById("smallPercent")
+            .textContent =
+                getPercent(
+                    small,
+                    total
+                )
+                + "% ของทั้งหมด";
+
+
+        document
+            .getElementById("mediumPercent")
+            .textContent =
+                getPercent(
+                    medium,
+                    total
+                )
+                + "% ของทั้งหมด";
+
+
+        document
+            .getElementById("largePercent")
+            .textContent =
+                getPercent(
+                    large,
+                    total
+                )
+                + "% ของทั้งหมด";
+
+
+        document
+            .getElementById("sickPercent")
+            .textContent =
+                getPercent(
+                    sick,
+                    total
+                )
+                + "% ของทั้งหมด";
+
+
+        // =================================================
+        // BARS
+        // =================================================
+
+        document
+            .getElementById("smallBar")
+            .style.width =
+                getPercent(
+                    small,
+                    total
+                ) + "%";
+
+
+        document
+            .getElementById("mediumBar")
+            .style.width =
+                getPercent(
+                    medium,
+                    total
+                ) + "%";
+
+
+        document
+            .getElementById("largeBar")
+            .style.width =
+                getPercent(
+                    large,
+                    total
+                ) + "%";
+
+
+        document
+            .getElementById("sickBar")
+            .style.width =
+                getPercent(
+                    sick,
+                    total
+                ) + "%";
+
+
+        document
+            .getElementById("smallBarText")
+            .textContent =
+                small + " ตัว";
+
+
+        document
+            .getElementById("mediumBarText")
+            .textContent =
+                medium + " ตัว";
+
+
+        document
+            .getElementById("largeBarText")
+            .textContent =
+                large + " ตัว";
+
+
+        document
+            .getElementById("sickBarText")
+            .textContent =
+                sick + " ตัว";
+
+
+        // =================================================
+        // HISTORY
+        // =================================================
 
         const tbody =
             document.getElementById(
@@ -1010,17 +2038,24 @@ async function load(){
             );
 
 
-        if(!data.history.length){
+        if (
+            !data.history ||
+            data.history.length === 0
+        ) {
 
             tbody.innerHTML = `
+
                 <tr>
+
                     <td
-                    colspan="6"
-                    class="empty"
+                        colspan="8"
+                        class="empty"
                     >
-                    ยังไม่มีประวัติ
+                        ยังไม่มีข้อมูลจาก AI
                     </td>
+
                 </tr>
+
             `;
 
             return;
@@ -1029,68 +2064,129 @@ async function load(){
 
 
         tbody.innerHTML =
-            data.history.map(
-                item => `
+            data.history
+                .map(
+                    function(item) {
 
-                <tr>
-
-                    <td>
-                        #${item.round_id}
-                    </td>
-
-                    <td>
-                        <b>
-                            ${item.total}
-                        </b> ตัว
-                    </td>
-
-                    <td>
-                        ${item.avg_fps}
-                    </td>
-
-                    <td>
-                        ${item.duration}s
-                    </td>
-
-                    <td>
-                        ${item.frames}
-                    </td>
-
-                    <td>
-                        ${formatTime(
-                            item.finished_at
-                        )}
-                    </td>
-
-                </tr>
-
-                `
-            ).join("");
+                        const c =
+                            item.counts || {};
 
 
-    }catch(error){
+                        const s =
+                            Number(
+                                c["กุ้งเล็ก"] || 0
+                            );
 
-        console.log(error);
+
+                        const m =
+                            Number(
+                                c["กุ้งกลาง"] || 0
+                            );
+
+
+                        const l =
+                            Number(
+                                c["กุ้งใหญ่"] || 0
+                            );
+
+
+                        const si =
+                            Number(
+                                c["กุ้งป่วย"] || 0
+                            );
+
+
+                        return `
+
+                        <tr>
+
+                            <td>
+
+                                <span
+                                    class="round"
+                                >
+                                    #${esc(
+                                        item.round_id
+                                    )}
+                                </span>
+
+                            </td>
+
+                            <td>
+                                ${s} ตัว
+                            </td>
+
+                            <td>
+                                ${m} ตัว
+                            </td>
+
+                            <td>
+                                ${l} ตัว
+                            </td>
+
+                            <td>
+
+                                <span
+                                    class="sick-value"
+                                >
+                                    ${si} ตัว
+                                </span>
+
+                            </td>
+
+                            <td>
+
+                                <span
+                                    class="total"
+                                >
+                                    ${item.total} ตัว
+                                </span>
+
+                            </td>
+
+                            <td>
+                                ${item.avg_fps}
+                            </td>
+
+                            <td>
+                                ${item.duration}s
+                            </td>
+
+                        </tr>
+
+                        `;
+
+                    }
+                )
+                .join("");
+
+
+    } catch (error) {
+
+        console.log(
+            "Dashboard error:",
+            error
+        );
 
     }
 
 }
 
 
-load();
+// =========================================================
+// START
+// =========================================================
 
+updateDashboard();
 
-/*
-อัปเดตเฉพาะข้อมูล
-ไม่เกี่ยวกับกล้อง
-*/
 
 setInterval(
-    load,
+    updateDashboard,
     2000
 );
 
 </script>
+
 
 </body>
 
@@ -1099,7 +2195,8 @@ setInterval(
 
 
 # =========================================================
-# PAGE 2 LIVE CAMERA
+# PAGE 2
+# LIVE CAMERA
 # =========================================================
 
 LIVE_PAGE = r"""
@@ -1112,161 +2209,203 @@ LIVE_PAGE = r"""
 <meta charset="UTF-8">
 
 <meta
-name="viewport"
-content="width=device-width,initial-scale=1"
+    name="viewport"
+    content="width=device-width,initial-scale=1"
 >
 
-<title>กล้อง Live</title>
+<title>กล้อง Real-time - ระบบคัดแยกกุ้ง</title>
 
 <style>
 
-*{
-    box-sizing:border-box;
+* {
+    box-sizing: border-box;
 }
 
-body{
+body {
 
-    margin:0;
+    margin: 0;
 
-    background:#050d14;
+    background: #f5f9fc;
 
-    color:white;
+    color: #183247;
 
     font-family:
         "Noto Sans Thai",
+        "Segoe UI",
         Arial,
         sans-serif;
 }
 
-header{
 
-    padding:20px;
+/* HEADER */
 
-    background:
-        linear-gradient(
-            135deg,
-            #064e3b,
-            #075985
-        );
+header {
 
-    display:flex;
+    background: #ffffff;
 
-    justify-content:space-between;
+    border-bottom:
+        1px solid #dbeaf2;
 
-    align-items:center;
+    padding: 18px 30px;
 
-    flex-wrap:wrap;
+    display: flex;
 
-    gap:10px;
+    justify-content: space-between;
+
+    align-items: center;
+
+    gap: 15px;
+
+    flex-wrap: wrap;
+
+    box-shadow:
+        0 3px 15px
+        rgba(40,90,120,.08);
 }
 
-h1{
+h1 {
 
-    margin:0;
+    margin: 0;
 
-    font-size:22px;
+    color: #16435d;
+
+    font-size: 22px;
 }
 
-nav{
+nav {
 
-    display:flex;
+    display: flex;
 
-    gap:8px;
+    gap: 8px;
 }
 
-nav a{
+nav a {
 
-    color:white;
+    text-decoration: none;
 
-    text-decoration:none;
+    color: #506b7a;
 
-    padding:8px 14px;
+    padding: 9px 15px;
 
-    border-radius:8px;
+    border-radius: 9px;
 
-    background:
-        rgba(255,255,255,.1);
+    border: 1px solid #d5e5ed;
+
+    background: #ffffff;
 }
 
-nav a.active{
+nav a.active {
 
-    background:#f97316;
+    background: #0ea5e9;
+
+    border-color: #0ea5e9;
+
+    color: #ffffff;
 }
 
-main{
 
-    width:min(1100px,94%);
+/* MAIN */
 
-    margin:25px auto;
+main {
+
+    width: min(1100px,94%);
+
+    margin: 25px auto;
 }
 
-.camera{
 
-    background:#0c1b27;
+/* CAMERA */
 
-    border:1px solid #1c3548;
+.camera {
 
-    border-radius:15px;
+    background: #ffffff;
 
-    padding:15px;
+    border: 1px solid #dceaf1;
+
+    border-radius: 16px;
+
+    padding: 18px;
+
+    box-shadow:
+        0 5px 18px
+        rgba(50,100,130,.08);
 }
 
-.video{
+.video {
 
-    background:#02070b;
+    width: 100%;
 
-    aspect-ratio:16/9;
+    aspect-ratio: 16 / 9;
 
-    border-radius:12px;
+    background: #eef5f8;
 
-    overflow:hidden;
+    border-radius: 12px;
 
-    display:flex;
+    overflow: hidden;
 
-    align-items:center;
+    display: flex;
 
-    justify-content:center;
+    align-items: center;
+
+    justify-content: center;
+
+    border: 1px solid #dbe9ef;
 }
 
-video,img{
+#frame {
 
-    width:100%;
+    width: 100%;
 
-    height:100%;
+    height: 100%;
 
-    object-fit:contain;
+    object-fit: contain;
+
+    display: none;
 }
 
-#frame{
+.placeholder {
 
-    display:none;
+    color: #7d96a4;
+
+    text-align: center;
+
+    font-size: 14px;
 }
 
-.placeholder{
+.placeholder-icon {
 
-    color:#648094;
+    font-size: 55px;
 
-    text-align:center;
+    margin-bottom: 10px;
 }
 
-.status{
 
-    margin-top:12px;
+/* STATUS */
 
-    padding:12px;
+.status {
 
-    border-radius:10px;
+    margin-top: 13px;
 
-    background:#301919;
+    padding: 12px 15px;
 
-    color:#fca5a5;
+    border-radius: 10px;
+
+    background: #fff1f1;
+
+    border: 1px solid #ffd6d6;
+
+    color: #dc2626;
+
+    font-size: 13px;
 }
 
-.status.online{
+.status.online {
 
-    background:#0c3527;
+    background: #edfff4;
 
-    color:#86efac;
+    border-color: #c8efd8;
+
+    color: #15803d;
 }
 
 </style>
@@ -1280,7 +2419,7 @@ video,img{
 <header>
 
 <h1>
-📷 กล้อง AI แบบ Real-time
+🦐 กล้องคัดแยกกุ้ง Real-time
 </h1>
 
 
@@ -1291,8 +2430,8 @@ video,img{
 </a>
 
 <a
-href="/live"
-class="active"
+    href="/live"
+    class="active"
 >
 📷 กล้อง Live
 </a>
@@ -1309,20 +2448,20 @@ class="active"
 <div class="video">
 
 <img
-id="frame"
-alt="Live camera"
+    id="frame"
+    alt="Live camera"
 >
 
 <div
-id="placeholder"
-class="placeholder"
+    id="placeholder"
+    class="placeholder"
 >
 
+<div class="placeholder-icon">
 📷
+</div>
 
-<br>
-
-กำลังรอสัญญาณจากกล้อง...
+กำลังรอสัญญาณจาก AI...
 
 </div>
 
@@ -1330,12 +2469,10 @@ class="placeholder"
 
 
 <div
-id="status"
-class="status"
+    id="status"
+    class="status"
 >
-
-● กำลังเชื่อมต่อกล้อง
-
+● กำลังรอสัญญาณจากกล้อง
 </div>
 
 </div>
@@ -1345,23 +2482,21 @@ class="status"
 
 <script>
 
-let last = 0;
 
+async function updateCamera() {
 
-async function update(){
+    try {
 
-    try{
-
-        const res =
+        const response =
             await fetch(
                 "/api/live/status",
                 {
-                    cache:"no-store"
+                    cache: "no-store"
                 }
             );
 
         const data =
-            await res.json();
+            await response.json();
 
 
         const status =
@@ -1370,7 +2505,19 @@ async function update(){
             );
 
 
-        if(data.online){
+        const frame =
+            document.getElementById(
+                "frame"
+            );
+
+
+        const placeholder =
+            document.getElementById(
+                "placeholder"
+            );
+
+
+        if (data.online) {
 
             status.className =
                 "status online";
@@ -1378,7 +2525,22 @@ async function update(){
             status.textContent =
                 "● กล้องออนไลน์";
 
-        }else{
+
+            if (data.has_frame) {
+
+                frame.src =
+                    "/api/live/frame?t="
+                    + Date.now();
+
+                frame.style.display =
+                    "block";
+
+                placeholder.style.display =
+                    "none";
+
+            }
+
+        } else {
 
             status.className =
                 "status";
@@ -1389,33 +2551,7 @@ async function update(){
         }
 
 
-        if(
-            data.has_frame &&
-            data.online
-        ){
-
-            const img =
-                document.getElementById(
-                    "frame"
-                );
-
-            img.src =
-                "/api/live/frame?t="
-                + Date.now();
-
-            img.style.display =
-                "block";
-
-            document
-                .getElementById(
-                    "placeholder"
-                )
-                .style.display =
-                "none";
-
-        }
-
-    }catch(error){
+    } catch (error) {
 
         console.log(error);
 
@@ -1424,14 +2560,16 @@ async function update(){
 }
 
 
+updateCamera();
+
+
 setInterval(
-    update,
+    updateCamera,
     1000
 );
 
-update();
-
 </script>
+
 
 </body>
 
