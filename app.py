@@ -1,12 +1,13 @@
 """
-เว็บแอปตรวจจับกุ้ง (Gradio) - สำหรับอัปโหลดขึ้น Hugging Face Spaces
-จะได้ลิงก์เว็บสาธารณะ เปิดใช้ได้ทันทีจากทุกเครื่อง ไม่ต้องติดตั้งอะไร
+เว็บแอปตรวจจับกุ้ง (Gradio) - สำหรับ deploy บน Render
 """
 
-import gradio as gr
-from ultralytics import YOLO
+import os
+
 import cv2
+import gradio as gr
 import numpy as np
+from ultralytics import YOLO
 
 MODEL_PATH = "best.pt"  # ต้องอยู่โฟลเดอร์เดียวกับไฟล์นี้เสมอ
 CONFIDENCE = 0.4
@@ -50,8 +51,16 @@ def detect_shrimp(input_image):
         color = get_color(class_id)
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
         label = f"{name} {conf:.2f}"
-        cv2.putText(annotated, label, (x1, max(y1 - 8, 15)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+        cv2.putText(
+            annotated,
+            label,
+            (x1, max(y1 - 8, 15)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
         class_counts[name] = class_counts.get(name, 0) + 1
 
     # แปลงกลับเป็น RGB ก่อนส่งคืนให้ Gradio แสดงผล
@@ -71,11 +80,15 @@ demo = gr.Interface(
     inputs=gr.Image(label="อัปโหลดภาพกุ้ง"),
     outputs=[
         gr.Image(label="ผลการตรวจจับ"),
-        gr.Markdown(label="สรุปผล"),
+        gr.Markdown(),
     ],
     title="🦐 ระบบตรวจจับกุ้ง AI",
     description="อัปโหลดภาพกุ้งเพื่อตรวจจับตำแหน่งและจำแนกชนิด",
 )
 
 if __name__ == "__main__":
-    demo.launch()
+    # Render กำหนดพอร์ตผ่านตัวแปร PORT และต้องฟังที่ 0.0.0.0
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=int(os.environ.get("PORT", 7860)),
+    )
