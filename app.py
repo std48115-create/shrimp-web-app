@@ -16,77 +16,93 @@ from pydantic import BaseModel, Field
 API_KEY = os.environ.get("API_KEY", "change-me")
 
 app = FastAPI(
-    title="Shrimp Realtime Dashboard",
-    version="1.0.0"
+    title="Shrimp AI Dashboard",
+    version="2.0"
 )
 
 
 # =========================================================
-# REALTIME STATE
+# DATA
 # =========================================================
 
-state = {
-    "counts": {},
-    "fps": 0.0,
-    "frame": None,
-    "ts": 0.0,
-}
+# ผลรอบล่าสุด
+latest_round = None
 
-# เก็บจำนวนกุ้งย้อนหลัง
-history = deque(maxlen=120)
+# เก็บประวัติสูงสุด 100 รอบ
+round_history = deque(maxlen=100)
+
+# ภาพล่าสุดจากกล้อง
+live_frame = None
+live_ts = 0
 
 
 # =========================================================
-# DATA MODEL
+# MODEL
 # =========================================================
 
-class Report(BaseModel):
+class RoundReport(BaseModel):
+
+    # เลขรอบ เช่น 1, 2, 3
+    round_id: int = 0
+
+    # จำนวนกุ้งแต่ละชนิด
     counts: dict[str, int] = Field(default_factory=dict)
+
+    # FPS เฉลี่ย
+    avg_fps: float = 0.0
+
+    # เวลาที่ใช้ในการตรวจ
+    duration: float = 0.0
+
+    # จำนวนเฟรมที่ตรวจ
+    frames: int = 0
+
+    # เวลาที่เริ่มรอบ
+    started_at: str | None = None
+
+    # เวลาที่จบรอบ
+    finished_at: str | None = None
+
+    # ภาพจาก AI
+    frame_b64: str | None = None
+
+
+class LiveReport(BaseModel):
+
+    counts: dict[str, int] = Field(default_factory=dict)
+
     fps: float = 0.0
+
     frame_b64: str | None = None
 
 
 # =========================================================
-# RECEIVE DATA FROM CAMERA / AI
+# RECEIVE COMPLETED ROUND
 # =========================================================
 
-@app.post("/api/report")
-def report(
-    data: Report,
+@app.post("/api/round")
+def receive_round(
+    data: RoundReport,
     x_api_key: str = Header(default="")
 ):
-    """
-    camera_client.py ส่งข้อมูลมายัง endpoint นี้
-    """
+
+    global latest_round
+    global live_frame
+    global live_ts
+
+    # -------------------------
+    # ตรวจ API KEY
+    # -------------------------
 
     if x_api_key != API_KEY:
+
         raise HTTPException(
             status_code=401,
             detail="Invalid API key"
         )
 
-    frame = None
-
     # -------------------------
-    # Decode image
-    # -------------------------
-
-    if data.frame_b64:
-
-        try:
-            frame = base64.b64decode(
-                data.frame_b64,
-                validate=True
-            )
-
-        except Exception:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid base64 image"
-            )
-
-    # -------------------------
-    # Clean counts
+    # ทำความสะอาดข้อมูล
     # -------------------------
 
     clean_counts = {}
@@ -104,81 +120,214 @@ def report(
         clean_counts[str(name)] = value
 
     # -------------------------
-    # Update state
+    # รวมทั้งหมด
     # -------------------------
-
-    state["counts"] = clean_counts
-    state["fps"] = max(0.0, float(data.fps))
-    state["frame"] = frame
-    state["ts"] = time.time()
 
     total = sum(clean_counts.values())
 
-    history.append(total)
+    # -------------------------
+    # สร้างข้อมูลรอบ
+    # -------------------------
+
+    result = {
+
+        "round_id": data.round_id,
+
+        "counts": clean_counts,
+
+        "total": total,
+
+        "avg_fps": round(
+            max(0, float(data.avg_fps)),
+            2
+        ),
+
+        "duration": round(
+            max(0, float(data.duration)),
+            2
+        ),
+
+        "frames": max(
+            0,
+            int(data.frames)
+        ),
+
+        "started_at":
+            data.started_at,
+
+        "finished_at":
+            data.finished_at,
+
+        "received_at":
+            time.time()
+    }
+
+    # -------------------------
+    # บันทึก
+    # -------------------------
+
+    latest_round = result
+
+    round_history.appendleft(result)
+
+    # -------------------------
+    # ถ้ามีภาพให้เก็บไว้ด้วย
+    # -------------------------
+
+    if data.frame_b64:
+
+        try:
+
+            live_frame = base64.b64decode(
+                data.frame_b64,
+                validate=True
+            )
+
+            live_ts = time.time()
+
+        except Exception:
+
+            pass
 
     return {
+
         "ok": True,
-        "total": total
+
+        "round_id":
+            data.round_id,
+
+        "total":
+            total
+
     }
 
 
 # =========================================================
-# LATEST DATA
+# RECEIVE LIVE CAMERA
 # =========================================================
 
-@app.get("/api/latest")
-def latest():
+@app.post("/api/live")
+def receive_live(
+    data: LiveReport,
+    x_api_key: str = Header(default="")
+):
 
-    has_data = state["ts"] > 0
+    global live_frame
+    global live_ts
 
-    age = (
-        time.time() - state["ts"]
-        if has_data
-        else 0
-    )
+    if x_api_key != API_KEY:
 
-    online = (
-        has_data
-        and age < 10
-    )
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key"
+        )
+
+    if data.frame_b64:
+
+        try:
+
+            live_frame = base64.b64decode(
+                data.frame_b64,
+                validate=True
+            )
+
+            live_ts = time.time()
+
+        except Exception:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid image"
+            )
 
     return {
-        "has_data": has_data,
-        "online": online,
-        "age": age,
-        "ts": state["ts"],
-        "counts": state["counts"],
-        "total": sum(state["counts"].values()),
-        "fps": state["fps"],
-        "has_frame": state["frame"] is not None,
-        "history": list(history),
+        "ok": True
     }
 
 
 # =========================================================
-# CAMERA FRAME
+# DASHBOARD DATA
 # =========================================================
 
-@app.get("/api/frame")
-def frame():
+@app.get("/api/dashboard")
+def dashboard():
 
-    if state["frame"] is None:
-        return Response(status_code=204)
+    return {
+
+        "has_round":
+            latest_round is not None,
+
+        "latest":
+            latest_round,
+
+        "history":
+            list(round_history)
+
+    }
+
+
+# =========================================================
+# LIVE STATUS
+# =========================================================
+
+@app.get("/api/live/status")
+def live_status():
+
+    if live_ts == 0:
+
+        return {
+            "online": False,
+            "age": 0
+        }
+
+    age = time.time() - live_ts
+
+    return {
+
+        "online":
+            age < 10,
+
+        "age":
+            age,
+
+        "has_frame":
+            live_frame is not None
+
+    }
+
+
+# =========================================================
+# LIVE FRAME
+# =========================================================
+
+@app.get("/api/live/frame")
+def get_live_frame():
+
+    if live_frame is None:
+
+        return Response(
+            status_code=204
+        )
 
     return Response(
-        state["frame"],
+
+        live_frame,
+
         media_type="image/jpeg",
+
         headers={
-            "Cache-Control": "no-store, no-cache, must-revalidate"
+            "Cache-Control":
+                "no-store"
         }
+
     )
 
 
 # =========================================================
-# DASHBOARD
+# PAGE 1
 # =========================================================
 
-PAGE = r"""
+DASHBOARD_PAGE = r"""
 <!DOCTYPE html>
 
 <html lang="th">
@@ -188,11 +337,11 @@ PAGE = r"""
 <meta charset="UTF-8">
 
 <meta
-    name="viewport"
-    content="width=device-width, initial-scale=1.0"
+name="viewport"
+content="width=device-width,initial-scale=1"
 >
 
-<title>ระบบตรวจจับกุ้ง AI</title>
+<title>สรุปผลการตรวจจับกุ้ง</title>
 
 <style>
 
@@ -201,26 +350,25 @@ PAGE = r"""
 }
 
 body{
+
     margin:0;
+
     background:#07111c;
+
     color:#e8f2f8;
+
     font-family:
         "Noto Sans Thai",
-        "Segoe UI",
         Arial,
         sans-serif;
 }
 
 
-/* =====================================================
-   HEADER
-===================================================== */
+/* HEADER */
 
 header{
 
-    min-height:80px;
-
-    padding:18px 30px;
+    padding:20px 30px;
 
     background:
         linear-gradient(
@@ -232,234 +380,83 @@ header{
 
     display:flex;
 
-    justify-content:space-between;
-
     align-items:center;
+
+    justify-content:space-between;
 
     gap:15px;
 
     flex-wrap:wrap;
-
-    box-shadow:
-        0 5px 30px rgba(0,0,0,.35);
 }
 
-.logo{
-
-    display:flex;
-
-    align-items:center;
-
-    gap:12px;
-}
-
-.logo-icon{
-
-    width:48px;
-
-    height:48px;
-
-    border-radius:14px;
-
-    background:
-        rgba(255,255,255,.12);
-
-    display:flex;
-
-    align-items:center;
-
-    justify-content:center;
-
-    font-size:27px;
-}
-
-.logo h1{
+h1{
 
     margin:0;
 
-    font-size:22px;
-
-    font-weight:700;
+    font-size:24px;
 }
 
-.logo p{
+.subtitle{
 
-    margin:3px 0 0;
+    color:#a9c5d6;
 
-    color:#b7d7e8;
-
-    font-size:12px;
-}
-
-
-/* =====================================================
-   STATUS
-===================================================== */
-
-.status{
-
-    display:flex;
-
-    align-items:center;
-
-    gap:8px;
-
-    padding:9px 16px;
-
-    border-radius:30px;
-
-    background:#3b2020;
-
-    color:#fca5a5;
-
-    font-size:14px;
-
-    font-weight:600;
-}
-
-.status.online{
-
-    background:#0b3d2b;
-
-    color:#86efac;
-}
-
-.dot{
-
-    width:9px;
-
-    height:9px;
-
-    border-radius:50%;
-
-    background:#ef4444;
-}
-
-.status.online .dot{
-
-    background:#22c55e;
-
-    box-shadow:
-        0 0 12px #22c55e;
-}
-
-
-/* =====================================================
-   MAIN
-===================================================== */
-
-.container{
-
-    width:min(1250px, 94%);
-
-    margin:25px auto;
-
-}
-
-
-/* =====================================================
-   TOP CARDS
-===================================================== */
-
-.stats{
-
-    display:grid;
-
-    grid-template-columns:
-        repeat(4, 1fr);
-
-    gap:15px;
-
-    margin-bottom:18px;
-}
-
-.stat{
-
-    background:#0e2030;
-
-    border:1px solid #1b3549;
-
-    border-radius:16px;
-
-    padding:20px;
-
-    box-shadow:
-        0 8px 25px rgba(0,0,0,.2);
-
-    transition:.2s;
-}
-
-.stat:hover{
-
-    transform:translateY(-2px);
-
-    border-color:#2c526b;
-}
-
-.stat-top{
-
-    display:flex;
-
-    justify-content:space-between;
-
-    align-items:center;
-}
-
-.stat-title{
-
-    color:#91b1c4;
+    margin-top:4px;
 
     font-size:13px;
 }
 
-.stat-icon{
 
-    width:38px;
+/* NAV */
 
-    height:38px;
-
-    border-radius:11px;
+nav{
 
     display:flex;
 
-    align-items:center;
-
-    justify-content:center;
-
-    background:#12334a;
-
-    font-size:20px;
+    gap:8px;
 }
 
-.stat-value{
+nav a{
 
-    margin-top:12px;
+    color:#dbeafe;
 
-    font-size:30px;
+    text-decoration:none;
 
-    font-weight:800;
+    padding:9px 15px;
+
+    border-radius:9px;
+
+    background:
+        rgba(255,255,255,.10);
 }
 
-.stat-unit{
+nav a.active{
 
-    color:#7897aa;
+    background:#f97316;
 
-    font-size:12px;
+    color:white;
 }
 
 
-/* =====================================================
-   GRID
-===================================================== */
+/* MAIN */
 
-.grid{
+main{
+
+    width:min(1200px,94%);
+
+    margin:25px auto;
+}
+
+
+/* CARDS */
+
+.cards{
 
     display:grid;
 
     grid-template-columns:
-        1.7fr 1fr;
+        repeat(4,1fr);
 
-    gap:18px;
+    gap:15px;
 }
 
 .card{
@@ -468,289 +465,193 @@ header{
 
     border:1px solid #1b3549;
 
-    border-radius:16px;
+    border-radius:15px;
 
-    padding:18px;
-
-    box-shadow:
-        0 8px 25px rgba(0,0,0,.2);
+    padding:20px;
 }
 
 .card-title{
 
-    display:flex;
+    color:#8eacbe;
 
-    justify-content:space-between;
-
-    align-items:center;
-
-    margin-bottom:14px;
+    font-size:13px;
 }
 
-.card-title h2{
+.number{
 
-    margin:0;
+    margin-top:10px;
 
-    font-size:16px;
-}
+    font-size:32px;
 
-.card-sub{
-
-    color:#7897aa;
-
-    font-size:12px;
-}
-
-
-/* =====================================================
-   VIDEO
-===================================================== */
-
-.video{
-
-    width:100%;
-
-    aspect-ratio:16/10;
-
-    background:#030b12;
-
-    border-radius:12px;
-
-    overflow:hidden;
-
-    position:relative;
-
-    display:flex;
-
-    align-items:center;
-
-    justify-content:center;
-
-    border:1px solid #183346;
-}
-
-.video img{
-
-    width:100%;
-
-    height:100%;
-
-    object-fit:contain;
-
-    display:none;
-}
-
-.placeholder{
-
-    color:#638095;
-
-    text-align:center;
-
-    font-size:14px;
-}
-
-.placeholder-icon{
-
-    font-size:45px;
-
-    margin-bottom:8px;
-}
-
-
-/* =====================================================
-   CAMERA INFO
-===================================================== */
-
-.camera-info{
-
-    display:grid;
-
-    grid-template-columns:
-        repeat(3,1fr);
-
-    gap:10px;
-
-    margin-top:12px;
-}
-
-.info{
-
-    background:#0a1926;
-
-    border-radius:10px;
-
-    padding:10px;
-
-    text-align:center;
-}
-
-.info small{
-
-    display:block;
-
-    color:#6f8da0;
-
-    font-size:11px;
-}
-
-.info b{
-
-    display:block;
-
-    margin-top:4px;
-
-    font-size:15px;
-}
-
-
-/* =====================================================
-   SPECIES
-===================================================== */
-
-.species{
-
-    display:flex;
-
-    flex-direction:column;
-
-    gap:8px;
-}
-
-.species-row{
-
-    display:flex;
-
-    align-items:center;
-
-    justify-content:space-between;
-
-    padding:13px 14px;
-
-    border-radius:10px;
-
-    background:#0a1926;
-
-    border:1px solid #173247;
-}
-
-.species-name{
-
-    display:flex;
-
-    align-items:center;
-
-    gap:9px;
-
-    font-size:14px;
-}
-
-.species-dot{
-
-    width:8px;
-
-    height:8px;
-
-    border-radius:50%;
-
-    background:#22c55e;
-}
-
-.species-count{
-
-    font-weight:700;
+    font-weight:800;
 
     color:#fb923c;
 }
 
 
-/* =====================================================
-   CHART
-===================================================== */
+/* LATEST */
 
-.chart-card{
+.latest{
 
     margin-top:18px;
 }
 
-.chart-wrap{
+.latest-header{
+
+    display:flex;
+
+    justify-content:space-between;
+
+    align-items:center;
+
+    margin-bottom:15px;
+}
+
+.latest-header h2{
+
+    margin:0;
+
+    font-size:18px;
+}
+
+.badge{
+
+    background:#123b32;
+
+    color:#86efac;
+
+    padding:6px 12px;
+
+    border-radius:20px;
+
+    font-size:12px;
+}
+
+
+/* SPECIES */
+
+.species{
+
+    display:grid;
+
+    grid-template-columns:
+        repeat(auto-fit,minmax(160px,1fr));
+
+    gap:10px;
+
+    margin-top:15px;
+}
+
+.species-item{
+
+    background:#091a28;
+
+    border:1px solid #173247;
+
+    border-radius:10px;
+
+    padding:14px;
+
+}
+
+.species-name{
+
+    color:#9bb7c7;
+
+    font-size:13px;
+}
+
+.species-value{
+
+    font-size:24px;
+
+    font-weight:bold;
+
+    color:#fb923c;
+
+    margin-top:5px;
+}
+
+
+/* TABLE */
+
+.history{
+
+    margin-top:18px;
+}
+
+.table-wrap{
+
+    overflow:auto;
+}
+
+table{
 
     width:100%;
 
-    height:250px;
+    border-collapse:collapse;
 
-    position:relative;
+    min-width:650px;
 }
 
-canvas{
+th,td{
 
-    width:100%;
+    padding:13px;
 
-    height:100%;
+    text-align:left;
 
+    border-bottom:
+        1px solid #193449;
 }
 
+th{
 
-/* =====================================================
-   FOOTER
-===================================================== */
+    color:#8faabb;
 
-footer{
+    font-size:12px;
+}
+
+td{
+
+    font-size:13px;
+}
+
+.empty{
 
     text-align:center;
 
-    color:#557185;
+    color:#668398;
 
-    font-size:12px;
-
-    padding:25px 0 35px;
+    padding:50px 10px;
 }
 
 
-/* =====================================================
-   RESPONSIVE
-===================================================== */
+/* RESPONSIVE */
 
 @media(max-width:900px){
 
-    .stats{
+    .cards{
 
         grid-template-columns:
             repeat(2,1fr);
-    }
-
-    .grid{
-
-        grid-template-columns:1fr;
     }
 }
 
 @media(max-width:550px){
 
+    .cards{
+
+        grid-template-columns:1fr;
+    }
+
     header{
 
-        padding:15px;
+        padding:18px;
     }
 
-    .logo h1{
+    h1{
 
-        font-size:18px;
-    }
-
-    .container{
-
-        width:94%;
-
-        margin-top:15px;
-    }
-
-    .stats{
-
-        grid-template-columns:1fr;
-    }
-
-    .camera-info{
-
-        grid-template-columns:1fr;
+        font-size:20px;
     }
 
 }
@@ -763,331 +664,139 @@ footer{
 <body>
 
 
-<!-- =====================================================
-     HEADER
-===================================================== -->
-
 <header>
-
-<div class="logo">
-
-<div class="logo-icon">
-🦐
-</div>
 
 <div>
 
-<h1>ระบบตรวจจับกุ้ง AI</h1>
+<h1>🦐 ระบบสรุปผลการตรวจจับกุ้ง AI</h1>
 
-<p>
-Shrimp Realtime Detection Dashboard
-</p>
-
+<div class="subtitle">
+ผลการทำงานของ AI แยกตามรอบ
 </div>
 
 </div>
 
 
-<div
-    id="status"
-    class="status"
+<nav>
+
+<a
+href="/"
+class="active"
 >
+📊 สรุปผล
+</a>
 
-<span class="dot"></span>
+<a href="/live">
+📷 กล้อง Live
+</a>
 
-<span id="statusText">
-กำลังเชื่อมต่อ...
-</span>
-
-</div>
+</nav>
 
 </header>
 
 
-<div class="container">
+<main>
 
 
-<!-- =====================================================
-     STATISTICS
-===================================================== -->
+<!-- STATS -->
 
-<div class="stats">
+<div class="cards">
 
-
-<div class="stat">
-
-<div class="stat-top">
-
-<span class="stat-title">
-กุ้งทั้งหมด
-</span>
-
-<div class="stat-icon">
-🦐
-</div>
-
-</div>
-
-<div
-    id="total"
-    class="stat-value"
->
--
-</div>
-
-<div class="stat-unit">
-ตัวในภาพปัจจุบัน
-</div>
-
-</div>
-
-
-<div class="stat">
-
-<div class="stat-top">
-
-<span class="stat-title">
-ความเร็ว AI
-</span>
-
-<div class="stat-icon">
-⚡
-</div>
-
-</div>
-
-<div
-    id="fps"
-    class="stat-value"
->
--
-</div>
-
-<div class="stat-unit">
-Frames / Second
-</div>
-
-</div>
-
-
-<div class="stat">
-
-<div class="stat-top">
-
-<span class="stat-title">
-ชนิดกุ้ง
-</span>
-
-<div class="stat-icon">
-🔬
-</div>
-
-</div>
-
-<div
-    id="classCount"
-    class="stat-value"
->
-0
-</div>
-
-<div class="stat-unit">
-ประเภทที่ตรวจพบ
-</div>
-
-</div>
-
-
-<div class="stat">
-
-<div class="stat-top">
-
-<span class="stat-title">
-อัปเดตล่าสุด
-</span>
-
-<div class="stat-icon">
-🕐
-</div>
-
-</div>
-
-<div
-    id="age"
-    class="stat-value"
-    style="font-size:22px"
->
--
-</div>
-
-<div class="stat-unit">
-วินาทีที่แล้ว
-</div>
-
-</div>
-
-
-</div>
-
-
-<!-- =====================================================
-     MAIN GRID
-===================================================== -->
-
-<div class="grid">
-
-
-<!-- CAMERA -->
 
 <div class="card">
 
 <div class="card-title">
-
-<div>
-
-<h2>📷 ภาพจากกล้อง</h2>
-
-<div class="card-sub">
-ภาพล่าสุดจากระบบ AI
+รอบล่าสุด
 </div>
-
-</div>
-
-</div>
-
-
-<div class="video">
-
-<img
-    id="frame"
-    alt="Camera frame"
->
 
 <div
-    id="placeholder"
-    class="placeholder"
+id="round"
+class="number"
 >
-
-<div class="placeholder-icon">
-📷
-</div>
-
-<div>
-รอสัญญาณจากกล้อง...
-</div>
-
-</div>
-
-</div>
-
-
-<div class="camera-info">
-
-<div class="info">
-
-<small>สถานะ</small>
-
-<b id="cameraStatus">
 -
-</b>
-
-</div>
-
-
-<div class="info">
-
-<small>จำนวน</small>
-
-<b id="cameraTotal">
--
-</b>
-
-</div>
-
-
-<div class="info">
-
-<small>อัปเดต</small>
-
-<b id="cameraAge">
--
-</b>
-
 </div>
 
 </div>
 
-</div>
-
-
-<!-- SPECIES -->
 
 <div class="card">
 
 <div class="card-title">
-
-<div>
-
-<h2>🦐 ชนิดกุ้ง</h2>
-
-<div class="card-sub">
-จำนวนที่ตรวจพบ
+กุ้งในรอบล่าสุด
 </div>
-
-</div>
-
-</div>
-
 
 <div
-    id="species"
-    class="species"
+id="total"
+class="number"
 >
+-
+</div>
 
-<div class="placeholder">
+</div>
+
+
+<div class="card">
+
+<div class="card-title">
+FPS เฉลี่ย
+</div>
+
+<div
+id="fps"
+class="number"
+>
+-
+</div>
+
+</div>
+
+
+<div class="card">
+
+<div class="card-title">
+เวลาทำงาน
+</div>
+
+<div
+id="duration"
+class="number"
+>
+-
+</div>
+
+</div>
+
+
+</div>
+
+
+<!-- LATEST ROUND -->
+
+<div class="card latest">
+
+<div class="latest-header">
+
+<h2>
+📋 ผลสรุปรอบล่าสุด
+</h2>
+
+<span
+class="badge"
+id="finished"
+>
 ยังไม่มีข้อมูล
-</div>
+</span>
 
 </div>
 
-</div>
-
-
-</div>
-
-
-<!-- =====================================================
-     CHART
-===================================================== -->
-
-<div class="card chart-card">
-
-<div class="card-title">
-
-<div>
-
-<h2>📈 จำนวนกุ้งย้อนหลัง</h2>
-
-<div class="card-sub">
-ข้อมูลล่าสุด 120 ครั้ง
-</div>
-
-</div>
 
 <div
-    id="chartMax"
-    class="card-sub"
+id="species"
+class="species"
 >
-สูงสุด -
-</div>
 
-</div>
-
-
-<div class="chart-wrap">
-
-<canvas id="chart"></canvas>
-
+<div class="empty">
+รอ AI ส่งผลการทำงานรอบแรก
 </div>
 
 </div>
@@ -1096,29 +805,72 @@ Frames / Second
 </div>
 
 
-<footer>
+<!-- HISTORY -->
 
-🦐 Shrimp AI Detection System
+<div class="card history">
 
-</footer>
+<div class="latest-header">
+
+<h2>
+📚 ประวัติการทำงาน
+</h2>
+
+</div>
+
+
+<div class="table-wrap">
+
+<table>
+
+<thead>
+
+<tr>
+
+<th>รอบ</th>
+
+<th>จำนวนกุ้ง</th>
+
+<th>FPS</th>
+
+<th>เวลา</th>
+
+<th>จำนวนเฟรม</th>
+
+<th>เวลาจบ</th>
+
+</tr>
+
+</thead>
+
+<tbody
+id="history"
+>
+
+<tr>
+
+<td
+colspan="6"
+class="empty"
+>
+ยังไม่มีประวัติ
+</td>
+
+</tr>
+
+</tbody>
+
+</table>
+
+</div>
+
+</div>
+
+
+</main>
 
 
 <script>
 
-
-// =========================================================
-// ELEMENTS
-// =========================================================
-
-const $ = id =>
-    document.getElementById(id);
-
-let lastTs = 0;
-
-
-// =========================================================
-// ESCAPE HTML
-// =========================================================
 
 function esc(value){
 
@@ -1133,467 +885,212 @@ function esc(value){
                 "'":"&#039;"
             }[c])
         );
-}
-
-
-// =========================================================
-// DRAW CHART
-// =========================================================
-
-function drawChart(history){
-
-    const canvas =
-        $("chart");
-
-    const ctx =
-        canvas.getContext("2d");
-
-    const rect =
-        canvas.getBoundingClientRect();
-
-    const dpr =
-        window.devicePixelRatio || 1;
-
-    canvas.width =
-        rect.width * dpr;
-
-    canvas.height =
-        rect.height * dpr;
-
-    ctx.setTransform(
-        dpr,
-        0,
-        0,
-        dpr,
-        0,
-        0
-    );
-
-    const w = rect.width;
-    const h = rect.height;
-
-    ctx.clearRect(
-        0,
-        0,
-        w,
-        h
-    );
-
-
-    if(!history.length){
-
-        ctx.fillStyle =
-            "#638095";
-
-        ctx.font =
-            "13px sans-serif";
-
-        ctx.fillText(
-            "ยังไม่มีข้อมูลสำหรับแสดงกราฟ",
-            15,
-            30
-        );
-
-        return;
-    }
-
-
-    const max =
-        Math.max(
-            5,
-            ...history
-        );
-
-
-    $("chartMax").textContent =
-        "สูงสุด " + max;
-
-
-    // -------------------------
-    // GRID
-    // -------------------------
-
-    ctx.strokeStyle =
-        "#173247";
-
-    ctx.lineWidth = 1;
-
-    for(let i=0;i<5;i++){
-
-        const y =
-            15 +
-            i *
-            ((h-35)/4);
-
-        ctx.beginPath();
-
-        ctx.moveTo(
-            0,
-            y
-        );
-
-        ctx.lineTo(
-            w,
-            y
-        );
-
-        ctx.stroke();
-
-    }
-
-
-    // -------------------------
-    // LINE
-    // -------------------------
-
-    ctx.strokeStyle =
-        "#fb923c";
-
-    ctx.lineWidth = 3;
-
-    ctx.lineJoin =
-        "round";
-
-    ctx.lineCap =
-        "round";
-
-    ctx.beginPath();
-
-
-    history.forEach(
-        (value,index)=>{
-
-            const x =
-                history.length === 1
-                ? w / 2
-                : index /
-                  (history.length - 1)
-                  * w;
-
-            const y =
-                h - 25 -
-                (value / max)
-                * (h - 50);
-
-            if(index === 0){
-
-                ctx.moveTo(
-                    x,
-                    y
-                );
-
-            }else{
-
-                ctx.lineTo(
-                    x,
-                    y
-                );
-
-            }
-
-        }
-    );
-
-    ctx.stroke();
-
-
-    // -------------------------
-    // LAST POINT
-    // -------------------------
-
-    const last =
-        history[history.length - 1];
-
-    const lastX =
-        history.length === 1
-        ? w / 2
-        : w;
-
-    const lastY =
-        h - 25 -
-        (last / max)
-        * (h - 50);
-
-
-    ctx.fillStyle =
-        "#fb923c";
-
-    ctx.beginPath();
-
-    ctx.arc(
-        lastX,
-        lastY,
-        5,
-        0,
-        Math.PI * 2
-    );
-
-    ctx.fill();
 
 }
 
 
-// =========================================================
-// UPDATE DASHBOARD
-// =========================================================
+function formatTime(value){
 
-async function updateDashboard(){
+    if(!value)
+        return "-";
+
+    return value;
+
+}
+
+
+async function load(){
 
     try{
 
-        const response =
+        const res =
             await fetch(
-                "/api/latest",
+                "/api/dashboard",
                 {
                     cache:"no-store"
                 }
             );
 
+        const data =
+            await res.json();
 
-        if(!response.ok){
 
-            throw new Error(
-                "Server error"
+        const latest =
+            data.latest;
+
+
+        if(!latest){
+
+            return;
+
+        }
+
+
+        document
+            .getElementById("round")
+            .textContent =
+                latest.round_id;
+
+
+        document
+            .getElementById("total")
+            .textContent =
+                latest.total;
+
+
+        document
+            .getElementById("fps")
+            .textContent =
+                latest.avg_fps;
+
+
+        document
+            .getElementById("duration")
+            .textContent =
+                latest.duration + "s";
+
+
+        document
+            .getElementById("finished")
+            .textContent =
+                latest.finished_at || "เสร็จแล้ว";
+
+
+        /* SPECIES */
+
+        const species =
+            document.getElementById(
+                "species"
             );
 
-        }
-
-
-        const data =
-            await response.json();
-
-
-        // -------------------------
-        // STATUS
-        // -------------------------
-
-        const status =
-            $("status");
-
-        const statusText =
-            $("statusText");
-
-
-        if(data.online){
-
-            status.className =
-                "status online";
-
-            statusText.textContent =
-                "● กล้องออนไลน์";
-
-        }else{
-
-            status.className =
-                "status";
-
-            statusText.textContent =
-                data.has_data
-                ? "● กล้องออฟไลน์"
-                : "● รอสัญญาณ";
-
-        }
-
-
-        // -------------------------
-        // TOTAL
-        // -------------------------
-
-        const total =
-            data.has_data
-            ? data.total
-            : "-";
-
-
-        $("total").textContent =
-            total;
-
-        $("cameraTotal").textContent =
-            total;
-
-
-        // -------------------------
-        // FPS
-        // -------------------------
-
-        $("fps").textContent =
-            data.has_data
-            ? Number(data.fps).toFixed(1)
-            : "-";
-
-
-        // -------------------------
-        // AGE
-        // -------------------------
-
-        const age =
-            data.has_data
-            ? Math.max(
-                0,
-                Math.round(data.age)
-              )
-            : "-";
-
-
-        $("age").textContent =
-            age;
-
-        $("cameraAge").textContent =
-            data.has_data
-            ? age + " วินาที"
-            : "-";
-
-
-        $("cameraStatus").textContent =
-            data.online
-            ? "ออนไลน์"
-            : "ออฟไลน์";
-
-
-        // -------------------------
-        // CLASSES
-        // -------------------------
 
         const entries =
             Object.entries(
-                data.counts || {}
-            ).sort(
-                (a,b)=>b[1]-a[1]
+                latest.counts || {}
             );
-
-
-        $("classCount").textContent =
-            entries.length;
-
-
-        const species =
-            $("species");
 
 
         if(!entries.length){
 
             species.innerHTML = `
-
-                <div class="placeholder">
-                    ยังไม่พบกุ้ง
+                <div class="empty">
+                    รอบนี้ไม่พบกุ้ง
                 </div>
-
             `;
 
         }else{
 
             species.innerHTML =
-                entries
-                .map(
-                    ([name,count])=>`
+                entries.map(
+                    ([name,value]) => `
 
-                    <div class="species-row">
+                    <div class="species-item">
 
                         <div class="species-name">
-
-                            <span class="species-dot">
-                            </span>
-
-                            <span>
-                                ${esc(name)}
-                            </span>
-
+                            🦐 ${esc(name)}
                         </div>
 
-                        <div class="species-count">
-                            ${count} ตัว
+                        <div class="species-value">
+                            ${value} ตัว
                         </div>
 
                     </div>
 
                     `
-                )
-                .join("");
+                ).join("");
 
         }
 
 
-        // -------------------------
-        // FRAME
-        // -------------------------
+        /* HISTORY */
 
-        if(
-            data.has_frame &&
-            data.ts !== lastTs
-        ){
-
-            lastTs =
-                data.ts;
+        const tbody =
+            document.getElementById(
+                "history"
+            );
 
 
-            const image =
-                $("frame");
+        if(!data.history.length){
 
+            tbody.innerHTML = `
+                <tr>
+                    <td
+                    colspan="6"
+                    class="empty"
+                    >
+                    ยังไม่มีประวัติ
+                    </td>
+                </tr>
+            `;
 
-            image.src =
-                "/api/frame?t="
-                + data.ts;
-
-
-            image.style.display =
-                "block";
-
-
-            $("placeholder")
-                .style.display =
-                "none";
+            return;
 
         }
 
 
-        // -------------------------
-        // CHART
-        // -------------------------
+        tbody.innerHTML =
+            data.history.map(
+                item => `
 
-        drawChart(
-            data.history || []
-        );
+                <tr>
+
+                    <td>
+                        #${item.round_id}
+                    </td>
+
+                    <td>
+                        <b>
+                            ${item.total}
+                        </b> ตัว
+                    </td>
+
+                    <td>
+                        ${item.avg_fps}
+                    </td>
+
+                    <td>
+                        ${item.duration}s
+                    </td>
+
+                    <td>
+                        ${item.frames}
+                    </td>
+
+                    <td>
+                        ${formatTime(
+                            item.finished_at
+                        )}
+                    </td>
+
+                </tr>
+
+                `
+            ).join("");
 
 
     }catch(error){
 
-        $("status").className =
-            "status";
-
-        $("statusText").textContent =
-            "● ติดต่อเซิร์ฟเวอร์ไม่ได้";
+        console.log(error);
 
     }
 
 }
 
 
-// =========================================================
-// START
-// =========================================================
+load();
 
-updateDashboard();
 
+/*
+อัปเดตเฉพาะข้อมูล
+ไม่เกี่ยวกับกล้อง
+*/
 
 setInterval(
-    updateDashboard,
-    1000
-);
-
-
-// =========================================================
-// RESIZE
-// =========================================================
-
-window.addEventListener(
-    "resize",
-    ()=>{
-        updateDashboard();
-    }
+    load,
+    2000
 );
 
 </script>
-
 
 </body>
 
@@ -1602,16 +1099,366 @@ window.addEventListener(
 
 
 # =========================================================
-# HOME
+# PAGE 2 LIVE CAMERA
+# =========================================================
+
+LIVE_PAGE = r"""
+<!DOCTYPE html>
+
+<html lang="th">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+name="viewport"
+content="width=device-width,initial-scale=1"
+>
+
+<title>กล้อง Live</title>
+
+<style>
+
+*{
+    box-sizing:border-box;
+}
+
+body{
+
+    margin:0;
+
+    background:#050d14;
+
+    color:white;
+
+    font-family:
+        "Noto Sans Thai",
+        Arial,
+        sans-serif;
+}
+
+header{
+
+    padding:20px;
+
+    background:
+        linear-gradient(
+            135deg,
+            #064e3b,
+            #075985
+        );
+
+    display:flex;
+
+    justify-content:space-between;
+
+    align-items:center;
+
+    flex-wrap:wrap;
+
+    gap:10px;
+}
+
+h1{
+
+    margin:0;
+
+    font-size:22px;
+}
+
+nav{
+
+    display:flex;
+
+    gap:8px;
+}
+
+nav a{
+
+    color:white;
+
+    text-decoration:none;
+
+    padding:8px 14px;
+
+    border-radius:8px;
+
+    background:
+        rgba(255,255,255,.1);
+}
+
+nav a.active{
+
+    background:#f97316;
+}
+
+main{
+
+    width:min(1100px,94%);
+
+    margin:25px auto;
+}
+
+.camera{
+
+    background:#0c1b27;
+
+    border:1px solid #1c3548;
+
+    border-radius:15px;
+
+    padding:15px;
+}
+
+.video{
+
+    background:#02070b;
+
+    aspect-ratio:16/9;
+
+    border-radius:12px;
+
+    overflow:hidden;
+
+    display:flex;
+
+    align-items:center;
+
+    justify-content:center;
+}
+
+video,img{
+
+    width:100%;
+
+    height:100%;
+
+    object-fit:contain;
+}
+
+#frame{
+
+    display:none;
+}
+
+.placeholder{
+
+    color:#648094;
+
+    text-align:center;
+}
+
+.status{
+
+    margin-top:12px;
+
+    padding:12px;
+
+    border-radius:10px;
+
+    background:#301919;
+
+    color:#fca5a5;
+}
+
+.status.online{
+
+    background:#0c3527;
+
+    color:#86efac;
+}
+
+</style>
+
+</head>
+
+
+<body>
+
+
+<header>
+
+<h1>
+📷 กล้อง AI แบบ Real-time
+</h1>
+
+
+<nav>
+
+<a href="/">
+📊 สรุปผล
+</a>
+
+<a
+href="/live"
+class="active"
+>
+📷 กล้อง Live
+</a>
+
+</nav>
+
+</header>
+
+
+<main>
+
+<div class="camera">
+
+<div class="video">
+
+<img
+id="frame"
+alt="Live camera"
+>
+
+<div
+id="placeholder"
+class="placeholder"
+>
+
+📷
+
+<br>
+
+กำลังรอสัญญาณจากกล้อง...
+
+</div>
+
+</div>
+
+
+<div
+id="status"
+class="status"
+>
+
+● กำลังเชื่อมต่อกล้อง
+
+</div>
+
+</div>
+
+</main>
+
+
+<script>
+
+let last = 0;
+
+
+async function update(){
+
+    try{
+
+        const res =
+            await fetch(
+                "/api/live/status",
+                {
+                    cache:"no-store"
+                }
+            );
+
+        const data =
+            await res.json();
+
+
+        const status =
+            document.getElementById(
+                "status"
+            );
+
+
+        if(data.online){
+
+            status.className =
+                "status online";
+
+            status.textContent =
+                "● กล้องออนไลน์";
+
+        }else{
+
+            status.className =
+                "status";
+
+            status.textContent =
+                "● รอสัญญาณจากกล้อง";
+
+        }
+
+
+        if(
+            data.has_frame &&
+            data.online
+        ){
+
+            const img =
+                document.getElementById(
+                    "frame"
+                );
+
+            img.src =
+                "/api/live/frame?t="
+                + Date.now();
+
+            img.style.display =
+                "block";
+
+            document
+                .getElementById(
+                    "placeholder"
+                )
+                .style.display =
+                "none";
+
+        }
+
+    }catch(error){
+
+        console.log(error);
+
+    }
+
+}
+
+
+setInterval(
+    update,
+    1000
+);
+
+update();
+
+</script>
+
+</body>
+
+</html>
+"""
+
+
+# =========================================================
+# ROUTES
 # =========================================================
 
 @app.get(
     "/",
     response_class=HTMLResponse
 )
-def index():
+def home():
 
-    return PAGE
+    return DASHBOARD_PAGE
+
+
+@app.get(
+    "/live",
+    response_class=HTMLResponse
+)
+def live():
+
+    return LIVE_PAGE
 
 
 # =========================================================
@@ -1621,12 +1468,16 @@ def index():
 if __name__ == "__main__":
 
     uvicorn.run(
+
         app,
+
         host="0.0.0.0",
+
         port=int(
             os.environ.get(
                 "PORT",
                 8000
             )
         )
+
     )
