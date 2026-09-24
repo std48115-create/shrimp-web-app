@@ -1,51 +1,33 @@
-import os
-import base64
-from collections import deque
-from datetime import datetime
-from typing import Dict, Any
-
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
+from collections import deque
+from datetime import datetime
+import base64
+import os
 import uvicorn
 
 
 # =========================================================
-# CONFIG
+# APP
 # =========================================================
 
+app = FastAPI(title="AI Shrimp Sorting System")
+
 API_KEY = os.getenv("API_KEY", "change-me")
-PORT = int(os.getenv("PORT", "10000"))
 
 SHRIMP_TYPES = [
     "กุ้งเล็ก",
     "กุ้งกลาง",
     "กุ้งใหญ่",
-    "กุ้งป่วย",
+    "กุ้งป่วย"
 ]
 
-app = FastAPI(
-    title="Shrimp AI Factory",
-    version="3.0"
-)
-
-
-# =========================================================
-# MEMORY
-# =========================================================
-
-latest_round: Dict[str, Any] = {}
-
-round_history = deque(maxlen=1000)
+latest_round = None
+round_history = deque(maxlen=500)
 
 live_frame = None
 live_ts = None
-
-live_status = {
-    "online": False,
-    "fps": 0,
-    "last_update": None
-}
 
 
 # =========================================================
@@ -53,128 +35,104 @@ live_status = {
 # =========================================================
 
 class RoundReport(BaseModel):
-
-    round_id: int = 0
-
-    counts: Dict[str, int] = Field(
-        default_factory=dict
-    )
-
+    round_id: int
+    counts: dict[str, int] = Field(default_factory=dict)
     avg_fps: float = 0
     duration: float = 0
     frames: int = 0
-
     started_at: str | None = None
     finished_at: str | None = None
 
 
 class LiveReport(BaseModel):
-
     frame: str | None = None
     fps: float = 0
+    counts: dict[str, int] = Field(default_factory=dict)
 
 
 # =========================================================
 # HELPERS
 # =========================================================
 
-def check_api_key(key):
-
-    if key != API_KEY:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid API Key"
-        )
-
-
 def clean_counts(counts):
-
     result = {}
 
-    for shrimp in SHRIMP_TYPES:
-
+    for shrimp_type in SHRIMP_TYPES:
         try:
-            value = int(
-                counts.get(shrimp, 0)
-            )
+            result[shrimp_type] = int(counts.get(shrimp_type, 0))
         except Exception:
-            value = 0
-
-        result[shrimp] = max(0, value)
+            result[shrimp_type] = 0
 
     return result
 
 
 def parse_datetime(value):
-
     if not value:
         return None
 
-    value = str(value).strip()
-
     formats = [
         "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%dT%H:%M:%S.%f",
-        "%Y-%m-%d"
     ]
 
     for fmt in formats:
-
         try:
-            return datetime.strptime(
-                value,
-                fmt
-            )
+            return datetime.strptime(value, fmt)
         except Exception:
             pass
 
     try:
-        return datetime.fromisoformat(
-            value.replace("Z", "+00:00")
-        )
+        return datetime.fromisoformat(value.replace("Z", ""))
     except Exception:
         return None
 
 
-def get_round_date(item):
+def get_report_datetime(report):
+    value = (
+        report.get("finished_at")
+        or report.get("started_at")
+        or report.get("received_at")
+    )
 
-    for key in [
-        "finished_at",
-        "started_at",
-        "received_at"
-    ]:
+    dt = parse_datetime(value)
 
-        dt = parse_datetime(
-            item.get(key)
-        )
-
-        if dt:
-            return dt
+    if dt:
+        return dt
 
     return datetime.now()
 
 
 def decode_frame(data):
-
     if not data:
         return None
 
     try:
-
         if "," in data:
             data = data.split(",", 1)[1]
 
         return base64.b64decode(data)
-
     except Exception:
-
         return None
 
 
+def check_api_key(x_api_key):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key"
+        )
+
+
+def total_counts(counts):
+    return sum(
+        int(counts.get(x, 0))
+        for x in SHRIMP_TYPES
+    )
+
+
 # =========================================================
-# ROUND API
+# API - ROUND
 # =========================================================
 
 @app.post("/api/round")
@@ -182,65 +140,38 @@ async def receive_round(
     report: RoundReport,
     x_api_key: str | None = Header(default=None)
 ):
-
     check_api_key(x_api_key)
 
-    counts = clean_counts(
-        report.counts
-    )
+    global latest_round
 
-    total = sum(
-        counts.values()
-    )
+    counts = clean_counts(report.counts)
 
     item = {
-
-        "round_id":
-            report.round_id,
-
-        "counts":
-            counts,
-
-        "total":
-            total,
-
-        "avg_fps":
-            report.avg_fps,
-
-        "duration":
-            report.duration,
-
-        "frames":
-            report.frames,
-
-        "started_at":
-            report.started_at,
-
-        "finished_at":
-            report.finished_at,
-
-        "received_at":
-            datetime.now().isoformat()
+        "round_id": report.round_id,
+        "counts": counts,
+        "avg_fps": report.avg_fps,
+        "duration": report.duration,
+        "frames": report.frames,
+        "started_at": report.started_at,
+        "finished_at": report.finished_at,
+        "received_at": datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
     }
 
-    latest_round.clear()
+    latest_round = item
 
-    latest_round.update(
-        item
-    )
-
-    round_history.appendleft(
-        item
-    )
+    round_history.appendleft(item)
 
     return {
         "success": True,
-        "data": item
+        "message": "Round received",
+        "round": item
     }
 
 
 # =========================================================
-# LIVE API
+# API - LIVE
 # =========================================================
 
 @app.post("/api/live")
@@ -248,27 +179,16 @@ async def receive_live(
     report: LiveReport,
     x_api_key: str | None = Header(default=None)
 ):
+    check_api_key(x_api_key)
 
     global live_frame
     global live_ts
 
-    check_api_key(x_api_key)
+    frame = decode_frame(report.frame)
 
-    decoded = decode_frame(
-        report.frame
-    )
-
-    if decoded:
-
-        live_frame = decoded
-
-    live_ts = datetime.now()
-
-    live_status["online"] = True
-    live_status["fps"] = report.fps
-    live_status["last_update"] = (
-        live_ts.isoformat()
-    )
+    if frame:
+        live_frame = frame
+        live_ts = datetime.now()
 
     return {
         "success": True
@@ -276,38 +196,31 @@ async def receive_live(
 
 
 # =========================================================
-# DASHBOARD API
+# API - DASHBOARD
 # =========================================================
 
 @app.get("/api/dashboard")
 async def dashboard_api():
 
-    counts = clean_counts(
-        latest_round.get(
-            "counts",
-            {}
-        )
-    )
+    if not latest_round:
+        return {
+            "latest_round": None,
+            "totals": {
+                x: 0 for x in SHRIMP_TYPES
+            },
+            "total": 0,
+            "rounds": 0
+        }
 
-    total = sum(
-        counts.values()
+    counts = clean_counts(
+        latest_round["counts"]
     )
 
     return {
-
-        "success": True,
-
-        "latest_round":
-            latest_round,
-
-        "counts":
-            counts,
-
-        "total":
-            total,
-
-        "rounds":
-            len(round_history)
+        "latest_round": latest_round,
+        "totals": counts,
+        "total": total_counts(counts),
+        "rounds": len(round_history)
     }
 
 
@@ -321,69 +234,47 @@ def build_analytics(mode):
 
     for item in round_history:
 
-        dt = get_round_date(
-            item
-        )
+        dt = get_report_datetime(item)
 
         if mode == "daily":
-
-            key = dt.strftime(
-                "%Y-%m-%d"
-            )
+            key = dt.strftime("%Y-%m-%d")
 
         elif mode == "monthly":
-
-            key = dt.strftime(
-                "%Y-%m"
-            )
+            key = dt.strftime("%Y-%m")
 
         else:
-
-            key = dt.strftime(
-                "%Y"
-            )
+            key = dt.strftime("%Y")
 
         if key not in groups:
-
             groups[key] = {
-
-                "label": key,
-
-                "rounds": 0,
-
+                "period": key,
                 "กุ้งเล็ก": 0,
                 "กุ้งกลาง": 0,
                 "กุ้งใหญ่": 0,
                 "กุ้งป่วย": 0,
-
-                "total": 0
+                "total": 0,
+                "rounds": 0
             }
+
+        counts = clean_counts(
+            item.get("counts", {})
+        )
+
+        for shrimp_type in SHRIMP_TYPES:
+            groups[key][shrimp_type] += counts[
+                shrimp_type
+            ]
+
+        groups[key]["total"] += total_counts(
+            counts
+        )
 
         groups[key]["rounds"] += 1
 
-        counts = clean_counts(
-            item.get(
-                "counts",
-                {}
-            )
-        )
-
-        for shrimp in SHRIMP_TYPES:
-
-            groups[key][shrimp] += (
-                counts[shrimp]
-            )
-
-        groups[key]["total"] += sum(
-            counts.values()
-        )
-
-    data = list(
-        groups.values()
-    )
+    data = list(groups.values())
 
     data.sort(
-        key=lambda x: x["label"]
+        key=lambda x: x["period"]
     )
 
     if mode == "daily":
@@ -399,81 +290,89 @@ def build_analytics(mode):
 
 
 @app.get("/api/analytics/daily")
-async def daily_api():
-
+async def analytics_daily():
     return {
-        "success": True,
-        "data":
-            build_analytics("daily")
+        "mode": "daily",
+        "data": build_analytics("daily")
     }
 
 
 @app.get("/api/analytics/monthly")
-async def monthly_api():
-
+async def analytics_monthly():
     return {
-        "success": True,
-        "data":
-            build_analytics("monthly")
+        "mode": "monthly",
+        "data": build_analytics("monthly")
     }
 
 
 @app.get("/api/analytics/yearly")
-async def yearly_api():
-
+async def analytics_yearly():
     return {
-        "success": True,
-        "data":
-            build_analytics("yearly")
+        "mode": "yearly",
+        "data": build_analytics("yearly")
     }
 
 
 # =========================================================
-# LIVE
+# LIVE STATUS
 # =========================================================
 
 @app.get("/api/live/status")
-async def live_status_api():
+async def live_status():
 
-    # ถ้าไม่มีข้อมูลเกิน 10 วินาที
-    # ถือว่า Offline
+    online = False
 
     if live_ts:
-
-        seconds = (
+        diff = (
             datetime.now() - live_ts
         ).total_seconds()
 
-        if seconds > 10:
+        online = diff <= 10
 
-            live_status["online"] = False
+    fps = 0
+
+    if latest_round:
+        fps = latest_round.get(
+            "avg_fps", 0
+        )
 
     return {
-        "success": True,
-        **live_status
+        "online": online,
+        "fps": fps,
+        "last_update": (
+            live_ts.strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            if live_ts
+            else None
+        )
     }
 
 
 @app.get("/api/live/frame")
-async def live_frame_api():
+async def get_live_frame():
 
     if not live_frame:
-
-        return Response(
-            status_code=404
+        raise HTTPException(
+            status_code=404,
+            detail="No frame"
         )
 
     return Response(
-
         content=live_frame,
-
         media_type="image/jpeg",
-
         headers={
             "Cache-Control":
-                "no-store, no-cache"
+                "no-store, no-cache, must-revalidate"
         }
     )
+
+
+@app.get("/api/health")
+async def health():
+    return {
+        "status": "ok"
+    }
 
 
 # =========================================================
@@ -485,23 +384,31 @@ CSS = r"""
     box-sizing: border-box;
 }
 
-html {
-    scroll-behavior: smooth;
-}
-
+html,
 body {
     margin: 0;
-
+    padding: 0;
     font-family:
-        Inter,
         "Noto Sans Thai",
+        "Segoe UI",
         Arial,
         sans-serif;
 
-    color: #17243a;
+    color: #152238;
+    background: #f4f8fc;
+}
 
-    background:
-        #f4f8fc;
+body {
+    min-height: 100vh;
+}
+
+a {
+    text-decoration: none !important;
+    color: inherit;
+}
+
+button {
+    font-family: inherit;
 }
 
 
@@ -510,201 +417,140 @@ body {
 ===================================================== */
 
 .sidebar {
-
     position: fixed;
-
     left: 0;
     top: 0;
     bottom: 0;
 
-    width: 258px;
+    width: 250px;
 
     background: #ffffff;
 
     border-right:
-        1px solid #e4ebf3;
+        1px solid #dce6f0;
 
-    padding: 22px 18px;
+    padding: 24px 16px;
 
     z-index: 100;
 
     display: flex;
-
     flex-direction: column;
 }
 
-
-/* BRAND */
-
-.brand {
-
+.logo {
     display: flex;
-
-    align-items: center;
-
-    gap: 12px;
-
-    padding:
-        4px 7px 27px;
-}
-
-.brand-icon {
-
-    width: 47px;
-    height: 47px;
-
-    border-radius: 15px;
-
-    display: grid;
-
-    place-items: center;
-
-    font-size: 24px;
-
-    color: white;
-
-    background:
-        linear-gradient(
-            135deg,
-            #4f8df7,
-            #6ca5ff
-        );
-
-    box-shadow:
-        0 8px 20px
-        rgba(66,132,240,.25);
-}
-
-.brand-title {
-
-    font-size: 17px;
-
-    font-weight: 800;
-
-    color: #17243a;
-
-    line-height: 1.15;
-}
-
-.brand-sub {
-
-    margin-top: 4px;
-
-    font-size: 10px;
-
-    color: #8391a6;
-}
-
-
-/* MENU */
-
-.sidebar-menu {
-
-    display: flex;
-
-    flex-direction: column;
-
-    gap: 5px;
-
-    flex: 1;
-}
-
-.menu-item {
-
-    display: flex;
-
     align-items: center;
 
     gap: 13px;
 
-    padding:
-        13px 13px;
-
-    border-radius: 14px;
-
-    color: #33445b;
-
-    font-size: 14px;
-
-    font-weight: 600;
-
-    transition: .2s;
-
-    cursor: pointer;
+    padding: 4px 10px 30px;
 }
 
-.menu-item:hover {
+.logo-box {
+    width: 48px;
+    height: 48px;
 
-    background: #f2f7fd;
-
-    color: #2372df;
-}
-
-.menu-item.active {
-
-    color: #2675e5;
+    display: grid;
+    place-items: center;
 
     background:
-        #eaf2ff;
+        linear-gradient(
+            135deg,
+            #0875e1,
+            #54a9ff
+        );
+
+    color: white;
+
+    border-radius: 11px;
+
+    font-size: 24px;
 
     box-shadow:
-        inset 0 -2px 0
-        #3d83ed;
+        0 9px 22px
+        rgba(25,116,220,.20);
 }
 
-.menu-icon {
-
-    width: 25px;
-
-    text-align: center;
-
+.logo-title {
     font-size: 18px;
+    font-weight: 900;
 }
 
+.logo-sub {
+    color: #8492a5;
+    font-size: 11px;
+    margin-top: 2px;
+    font-weight: 600;
+}
 
-/* SIDEBAR BOTTOM */
+.nav {
+    display: flex;
+    flex-direction: column;
 
-.sidebar-bottom {
+    gap: 4px;
 
+    flex: 1;
+}
+
+.nav a {
+    display: flex;
+    align-items: center;
+
+    gap: 13px;
+
+    padding: 13px 12px;
+
+    border-radius: 9px;
+
+    color: #536379;
+
+    font-size: 15px;
+
+    font-weight: 700;
+
+    transition: .18s;
+}
+
+.nav a:hover {
+    background: #f0f6fd;
+    color: #1671db;
+}
+
+.nav a.active {
+    background: #e6f1ff;
+    color: #086fe0;
+
+    border-left:
+        4px solid #1478e6;
+
+    padding-left: 8px;
+}
+
+.nav-icon {
+    width: 25px;
+    text-align: center;
+    font-size: 19px;
+}
+
+.sidebar-footer {
     border-top:
-        1px solid #e6edf5;
+        1px solid #e1e8ef;
 
     padding-top: 14px;
 }
 
-.mode-button {
-
-    width: 100%;
-
-    border: 0;
-
-    background:
-        #f0f5fb;
-
-    border-radius: 14px;
-
+.footer-status {
     padding: 12px;
 
-    color: #30415a;
+    background: #f3f7fb;
 
-    text-align: left;
+    border-radius: 8px;
 
-    font-size: 13px;
-
-    cursor: pointer;
-}
-
-.logout {
-
-    padding:
-        13px;
-
-    color:
-        #ff5d67;
+    color: #526277;
 
     font-size: 13px;
 
-    font-weight: 600;
+    font-weight: 800;
 }
 
 
@@ -713,8 +559,7 @@ body {
 ===================================================== */
 
 .main {
-
-    margin-left: 258px;
+    margin-left: 250px;
 
     min-height: 100vh;
 }
@@ -725,14 +570,12 @@ body {
 ===================================================== */
 
 .topbar {
+    height: 72px;
 
-    height: 67px;
-
-    background:
-        rgba(255,255,255,.94);
+    background: white;
 
     border-bottom:
-        1px solid #e3ebf4;
+        1px solid #dce6f0;
 
     display: flex;
 
@@ -740,96 +583,70 @@ body {
 
     justify-content: space-between;
 
-    padding:
-        0 25px;
+    padding: 0 32px;
 
     position: sticky;
 
     top: 0;
 
     z-index: 50;
-
-    backdrop-filter:
-        blur(15px);
-}
-
-.top-info {
-
-    display: flex;
-
-    flex-direction: column;
 }
 
 .top-label {
+    color: #1872dc;
 
-    color: #4b88f4;
+    font-size: 11px;
 
-    font-size: 10px;
+    font-weight: 900;
 
-    font-weight: 800;
-
-    letter-spacing: 1px;
+    letter-spacing: 1.4px;
 }
 
-.top-heading {
+.top-title {
+    margin-top: 2px;
 
-    font-size: 16px;
+    font-size: 19px;
 
-    font-weight: 800;
-
-    margin-top: 3px;
+    font-weight: 900;
 }
 
 .top-actions {
-
     display: flex;
-
-    align-items: center;
-
     gap: 9px;
 }
 
-.top-button {
-
-    width: 40px;
-    height: 40px;
-
-    border-radius: 12px;
+.top-btn {
+    width: 42px;
+    height: 42px;
 
     border:
-        1px solid #e3ebf4;
+        1px solid #dbe5ef;
 
-    background:
-        #f4f8fc;
+    background: #f6f9fc;
 
-    display: grid;
+    color: #42536a;
 
-    place-items: center;
-
-    color: #31435c;
+    border-radius: 9px;
 
     cursor: pointer;
 
-    font-size: 17px;
+    font-size: 18px;
 }
 
-.avatar {
-
-    width: 39px;
-    height: 39px;
-
-    border-radius: 50%;
+.user-box {
+    width: 42px;
+    height: 42px;
 
     display: grid;
-
     place-items: center;
 
-    background:
-        #5e91ee;
+    background: #1475df;
 
     color: white;
 
-    font-weight: 800;
+    border-radius: 9px;
+
+    font-weight: 900;
 }
 
 
@@ -838,351 +655,84 @@ body {
 ===================================================== */
 
 .content {
-
     width:
         min(
-            1100px,
-            calc(100% - 60px)
+            1180px,
+            calc(100% - 64px)
         );
 
-    margin:
-        0 auto;
+    margin: auto;
 
     padding:
-        39px 0 70px;
-
-    background-image:
-        linear-gradient(
-            rgba(62,113,182,.035) 1px,
-            transparent 1px
-        ),
-        linear-gradient(
-            90deg,
-            rgba(62,113,182,.035) 1px,
-            transparent 1px
-        );
-
-    background-size:
-        25px 25px;
+        40px 0 70px;
 }
 
 
 /* =====================================================
-   WELCOME
+   HEADER
 ===================================================== */
 
-.welcome {
-
-    margin-bottom: 25px;
+.page-head {
+    margin-bottom: 27px;
 }
 
-.welcome h1 {
-
+.page-head h1 {
     margin: 0;
 
-    font-size: 28px;
+    font-size: 34px;
 
-    font-weight: 800;
+    line-height: 1.2;
+
+    font-weight: 900;
 
     letter-spacing: -.6px;
 }
 
-.welcome p {
-
+.page-head p {
     margin:
         8px 0 0;
 
-    color: #8290a4;
+    color: #748398;
 
-    font-size: 14px;
+    font-size: 16px;
+
+    font-weight: 500;
 }
 
 
 /* =====================================================
-   AI RECOMMENDATION
+   STATUS
 ===================================================== */
 
-.ai-card {
-
-    position: relative;
-
-    overflow: hidden;
-
-    min-height: 210px;
-
-    padding:
-        25px 30px;
-
-    border-radius: 24px;
-
-    color: white;
-
-    background:
-        linear-gradient(
-            110deg,
-            #3275e4,
-            #2762c9
-        );
-
-    box-shadow:
-        0 18px 40px
-        rgba(40,100,210,.23);
-
-    margin-bottom: 25px;
-}
-
-.ai-card::after {
-
-    content: "";
-
-    position: absolute;
-
-    width: 210px;
-    height: 210px;
-
-    right: -75px;
-    top: -105px;
-
-    border-radius: 50%;
-
-    border:
-        35px solid
-        rgba(255,255,255,.10);
-}
-
-.ai-inner {
-
-    position: relative;
-
-    z-index: 2;
-
+.status-bar {
     display: flex;
-
-    gap: 17px;
-}
-
-.ai-icon {
-
-    width: 45px;
-    height: 45px;
-
-    flex-shrink: 0;
-
-    display: grid;
-
-    place-items: center;
-
-    border-radius: 14px;
-
-    background:
-        rgba(255,255,255,.18);
-
-    font-size: 22px;
-}
-
-.ai-title {
-
-    font-size: 17px;
-
-    font-weight: 800;
-}
-
-.ai-text {
-
-    max-width: 800px;
-
-    margin-top: 8px;
-
-    color:
-        rgba(255,255,255,.88);
-
-    line-height: 1.7;
-
-    font-size: 13px;
-}
-
-.ai-tags {
-
-    display: flex;
-
-    flex-wrap: wrap;
-
-    gap: 7px;
-
-    margin-top: 12px;
-}
-
-.ai-tag {
-
-    padding:
-        6px 10px;
-
-    border-radius: 999px;
-
-    background:
-        rgba(255,255,255,.17);
-
-    font-size: 11px;
-
-    font-weight: 700;
-}
-
-.ai-button {
-
-    display: inline-block;
-
-    margin-top: 14px;
-
-    padding:
-        10px 17px;
-
-    border-radius: 10px;
-
-    background:
-        white;
-
-    color:
-        #3976d9;
-
-    font-size: 12px;
-
-    font-weight: 800;
-}
-
-
-/* =====================================================
-   KPI AREA
-===================================================== */
-
-.stats-layout {
-
-    display: grid;
-
-    grid-template-columns:
-        1fr 2fr;
-
-    gap: 17px;
-
-    margin-bottom: 29px;
-}
-
-
-/* BIG GOAL CARD */
-
-.goal-card {
-
-    min-height: 220px;
-
-    border-radius: 22px;
-
-    background:
-        white;
-
-    border:
-        1px solid #e0e8f1;
-
-    box-shadow:
-        0 10px 35px
-        rgba(38,77,125,.07);
-
-    display: flex;
-
-    flex-direction: column;
 
     align-items: center;
 
-    justify-content: center;
-}
-
-.goal-circle {
-
-    width: 100px;
-    height: 100px;
-
-    border-radius: 50%;
+    justify-content: space-between;
 
     background:
-        conic-gradient(
-            #2dbb82 0 28%,
-            #e5edf5 28% 100%
+        linear-gradient(
+            100deg,
+            #0969d8,
+            #2d88eb
         );
 
-    position: relative;
-
-    display: grid;
-
-    place-items: center;
-}
-
-.goal-circle::after {
-
-    content: "";
-
-    position: absolute;
-
-    width: 76px;
-    height: 76px;
-
-    border-radius: 50%;
-
-    background:
-        white;
-}
-
-.goal-value {
-
-    position: relative;
-
-    z-index: 2;
-
-    font-size: 20px;
-
-    font-weight: 800;
-
-    color: #1f3150;
-}
-
-.goal-label {
-
-    margin-top: 12px;
-
-    font-size: 12px;
-
-    color: #7c8ba0;
-}
-
-
-/* KPI GRID */
-
-.kpi-grid {
-
-    display: grid;
-
-    grid-template-columns:
-        1fr 1fr;
-
-    gap: 17px;
-}
-
-.kpi-card {
-
-    min-height: 101px;
+    color: white;
 
     padding:
-        20px;
+        20px 23px;
 
-    border-radius: 20px;
+    border-radius: 12px;
 
-    background:
-        white;
-
-    border:
-        1px solid #e0e8f1;
+    margin-bottom: 23px;
 
     box-shadow:
-        0 10px 30px
-        rgba(38,77,125,.06);
+        0 14px 32px
+        rgba(27,112,216,.18);
+}
 
+.status-main {
     display: flex;
 
     align-items: center;
@@ -1190,69 +740,330 @@ body {
     gap: 15px;
 }
 
-.kpi-icon {
-
-    width: 45px;
-    height: 45px;
-
-    border-radius: 14px;
+.status-icon {
+    width: 46px;
+    height: 46px;
 
     display: grid;
-
     place-items: center;
 
-    font-size: 21px;
+    background:
+        rgba(255,255,255,.15);
 
-    flex-shrink: 0;
+    border-radius: 9px;
+
+    font-size: 22px;
 }
 
-.kpi-blue {
-    background: #eaf2ff;
-    color: #377ff0;
+.status-title {
+    font-size: 19px;
+    font-weight: 900;
 }
 
-.kpi-green {
-    background: #e5f8ef;
-    color: #18a66b;
+.status-text {
+    margin-top: 3px;
+
+    font-size: 12px;
+
+    color:
+        rgba(255,255,255,.78);
 }
 
-.kpi-orange {
-    background: #fff2dc;
-    color: #e99b1f;
+.status-pill {
+    background:
+        rgba(255,255,255,.16);
+
+    padding:
+        9px 14px;
+
+    border-radius: 7px;
+
+    font-size: 12px;
+
+    font-weight: 900;
 }
 
-.kpi-red {
-    background: #ffebee;
-    color: #ed5b69;
+
+/* =====================================================
+   KPI
+===================================================== */
+
+.kpi-grid {
+    display: grid;
+
+    grid-template-columns:
+        repeat(4, 1fr);
+
+    gap: 16px;
+
+    margin-bottom: 28px;
+}
+
+.kpi {
+    background: white;
+
+    border:
+        1px solid #dce6ef;
+
+    border-radius: 12px;
+
+    padding: 23px;
+
+    min-height: 145px;
+
+    box-shadow:
+        0 6px 23px
+        rgba(36,70,105,.06);
+
+    position: relative;
+}
+
+.kpi::before {
+    content: "";
+
+    position: absolute;
+
+    left: 0;
+    top: 0;
+    bottom: 0;
+
+    width: 4px;
+
+    background: #1777df;
+}
+
+.kpi.green::before {
+    background: #20aa76;
+}
+
+.kpi.orange::before {
+    background: #efa52b;
+}
+
+.kpi.red::before {
+    background: #df5e69;
 }
 
 .kpi-label {
+    color: #7c8b9e;
 
-    color:
-        #7d8ba0;
+    font-size: 13px;
 
-    font-size: 11px;
+    font-weight: 700;
 }
 
 .kpi-value {
+    margin-top: 9px;
 
-    margin-top: 4px;
+    font-size: 32px;
 
-    font-size: 21px;
+    font-weight: 900;
 
-    font-weight: 800;
-
-    color:
-        #1c2c45;
+    color: #15243a;
 }
 
-.kpi-sub {
+.kpi-unit {
+    margin-top: 4px;
+
+    color: #8491a2;
+
+    font-size: 12px;
+}
+
+
+/* =====================================================
+   SECTION
+===================================================== */
+
+.section-title {
+    margin:
+        0 0 16px;
+
+    font-size: 24px;
+
+    font-weight: 900;
+
+    color: #17263b;
+}
+
+
+/* =====================================================
+   SHRIMP
+===================================================== */
+
+.shrimp-grid {
+    display: grid;
+
+    grid-template-columns:
+        repeat(4, 1fr);
+
+    gap: 16px;
+
+    margin-bottom: 28px;
+}
+
+.shrimp-card {
+    background: white;
+
+    border:
+        1px solid #dce6ef;
+
+    border-radius: 12px;
+
+    padding: 22px;
+
+    min-height: 140px;
+
+    box-shadow:
+        0 6px 23px
+        rgba(36,70,105,.06);
+}
+
+.shrimp-header {
+    display: flex;
+
+    align-items: center;
+
+    justify-content: space-between;
+}
+
+.shrimp-name {
+    font-size: 17px;
+
+    font-weight: 900;
+
+    color: #2b3b51;
+}
+
+.shrimp-square {
+    width: 12px;
+    height: 12px;
+
+    border-radius: 3px;
+
+    background: #237ce4;
+}
+
+.shrimp-square.medium {
+    background: #20aa76;
+}
+
+.shrimp-square.large {
+    background: #efa52b;
+}
+
+.shrimp-square.sick {
+    background: #df5e69;
+}
+
+.shrimp-number {
+    margin-top: 16px;
+
+    font-size: 33px;
+
+    font-weight: 900;
+
+    color: #15243a;
+}
+
+.shrimp-unit {
+    color: #8391a3;
+
+    font-size: 12px;
 
     margin-top: 3px;
+}
 
-    color: #4784e6;
 
-    font-size: 10px;
+/* =====================================================
+   PANEL
+===================================================== */
+
+.panel {
+    background: white;
+
+    border:
+        1px solid #dce6ef;
+
+    border-radius: 12px;
+
+    padding: 24px;
+
+    margin-bottom: 22px;
+
+    box-shadow:
+        0 6px 23px
+        rgba(36,70,105,.06);
+}
+
+.panel-head {
+    display: flex;
+
+    justify-content: space-between;
+
+    align-items: center;
+
+    margin-bottom: 20px;
+}
+
+.panel-title {
+    font-size: 20px;
+
+    font-weight: 900;
+}
+
+.panel-sub {
+    color: #8491a2;
+
+    font-size: 13px;
+
+    margin-top: 4px;
+}
+
+
+/* =====================================================
+   TABLE
+===================================================== */
+
+.table-wrap {
+    overflow-x: auto;
+}
+
+table {
+    width: 100%;
+
+    border-collapse: collapse;
+
+    font-size: 14px;
+}
+
+th {
+    text-align: left;
+
+    padding: 15px;
+
+    background: #f3f7fb;
+
+    color: #66768b;
+
+    font-size: 13px;
+
+    font-weight: 900;
+}
+
+td {
+    padding: 16px 15px;
+
+    border-bottom:
+        1px solid #edf1f5;
+
+    color: #34455b;
+
+    font-weight: 600;
+}
+
+tr:hover td {
+    background: #f8fbff;
 }
 
 
@@ -1260,130 +1071,62 @@ body {
    QUICK MENU
 ===================================================== */
 
-.section-title {
-
-    margin:
-        0 0 17px;
-
-    font-size: 25px;
-
-    font-weight: 800;
-}
-
 .quick-grid {
-
     display: grid;
 
     grid-template-columns:
-        repeat(4,1fr);
+        repeat(4, 1fr);
 
     gap: 16px;
 }
 
 .quick-card {
-
-    min-height: 145px;
-
-    padding:
-        20px;
-
-    border-radius: 20px;
-
-    background:
-        white;
+    background: white;
 
     border:
-        1px solid #e0e8f1;
+        1px solid #dce6ef;
 
-    box-shadow:
-        0 10px 30px
-        rgba(38,77,125,.06);
+    border-radius: 12px;
 
-    display: flex;
+    padding: 22px;
 
-    flex-direction: column;
+    min-height: 125px;
 
-    align-items: center;
-
-    justify-content: center;
-
-    text-align: center;
-
-    transition:
-        .22s;
+    transition: .18s;
 }
 
 .quick-card:hover {
+    transform: translateY(-3px);
 
-    transform:
-        translateY(-4px);
-
-    border-color:
-        #b8d1f7;
+    border-color: #91bff0;
 
     box-shadow:
-        0 18px 35px
-        rgba(50,108,210,.12);
+        0 12px 28px
+        rgba(36,108,200,.10);
 }
 
-.quick-icon {
+.quick-no {
+    color: #1d78dd;
 
-    width: 47px;
-    height: 47px;
+    font-size: 12px;
 
-    border-radius: 14px;
-
-    display: grid;
-
-    place-items: center;
-
-    margin-bottom: 13px;
-
-    font-size: 21px;
-
-    background:
-        #eaf2ff;
-
-    color:
-        #347ce8;
-}
-
-.quick-icon.green {
-
-    background:
-        #e5f8ef;
-
-    color:
-        #18a66b;
-}
-
-.quick-icon.orange {
-
-    background:
-        #fff2dc;
-
-    color:
-        #e99b1f;
+    font-weight: 900;
 }
 
 .quick-title {
+    margin-top: 14px;
 
-    font-size: 14px;
+    font-size: 17px;
 
-    font-weight: 800;
-
-    color:
-        #24344c;
+    font-weight: 900;
 }
 
 .quick-desc {
-
     margin-top: 5px;
 
-    color:
-        #8996a8;
+    color: #8491a2;
 
-    font-size: 10px;
+    font-size: 12px;
 }
 
 
@@ -1391,630 +1134,301 @@ body {
    ANALYTICS
 ===================================================== */
 
-.page-title {
+.back {
+    display: inline-block;
 
-    margin-bottom: 25px;
+    padding:
+        9px 14px;
+
+    margin-bottom: 18px;
+
+    border:
+        1px solid #dce6ef;
+
+    border-radius: 8px;
+
+    background: white;
+
+    color: #2176db;
+
+    font-size: 13px;
+
+    font-weight: 800;
 }
 
-.back {
+.chart-panel {
+    background: white;
 
-    display: inline-flex;
+    border:
+        1px solid #dce6ef;
+
+    border-radius: 12px;
+
+    padding: 25px;
+
+    box-shadow:
+        0 6px 23px
+        rgba(36,70,105,.06);
+}
+
+.chart-area {
+    height: 430px;
+
+    margin-top: 15px;
+}
+
+canvas {
+    width: 100% !important;
+
+    height: 100% !important;
+}
+
+
+/* =====================================================
+   LIVE
+===================================================== */
+
+.live-grid {
+    display: grid;
+
+    grid-template-columns:
+        minmax(0, 1fr)
+        290px;
+
+    gap: 18px;
+}
+
+.camera-panel {
+    background: #071522;
+
+    min-height: 560px;
+
+    border-radius: 12px;
+
+    overflow: hidden;
+
+    position: relative;
+
+    display: grid;
+
+    place-items: center;
+}
+
+.camera-panel img {
+    width: 100%;
+
+    height: 100%;
+
+    object-fit: contain;
+}
+
+.camera-empty {
+    color: #7d8da0;
+
+    font-size: 15px;
+
+    text-align: center;
+}
+
+.live-label {
+    position: absolute;
+
+    left: 17px;
+    top: 17px;
+
+    background: #ffffff;
+
+    color: #16a56f;
 
     padding:
         8px 12px;
 
-    margin-bottom: 15px;
+    border-radius: 7px;
 
-    border-radius: 10px;
+    font-size: 12px;
 
-    background:
-        white;
+    font-weight: 900;
+}
+
+.live-info {
+    background: white;
 
     border:
-        1px solid #e0e8f1;
+        1px solid #dce6ef;
 
-    color:
-        #4a7fd4;
+    border-radius: 12px;
+
+    padding: 22px;
+
+    box-shadow:
+        0 6px 23px
+        rgba(36,70,105,.06);
+}
+
+.live-info h2 {
+    margin: 0 0 20px;
+
+    font-size: 20px;
+
+    font-weight: 900;
+}
+
+.live-stat {
+    padding:
+        17px 0;
+
+    border-bottom:
+        1px solid #edf1f5;
+}
+
+.live-stat:last-child {
+    border-bottom: 0;
+}
+
+.live-stat-label {
+    color: #8391a3;
 
     font-size: 12px;
 
     font-weight: 700;
 }
 
-.page-title h1 {
-
-    margin: 0;
-
-    font-size: 30px;
-}
-
-.page-title p {
-
-    color:
-        #8290a4;
-
-    font-size: 13px;
-}
-
-
-/* PANEL */
-
-.panel {
-
-    padding:
-        25px;
-
-    background:
-        white;
-
-    border:
-        1px solid #e0e8f1;
-
-    border-radius:
-        22px;
-
-    box-shadow:
-        0 10px 35px
-        rgba(38,77,125,.06);
-
-    margin-bottom:
-        20px;
-}
-
-.panel-title {
-
-    font-size: 18px;
-
-    font-weight: 800;
-}
-
-.panel-sub {
-
+.live-stat-value {
     margin-top: 5px;
 
-    color:
-        #8b98a9;
+    font-size: 25px;
 
-    font-size: 12px;
-}
+    font-weight: 900;
 
-
-/* CHART */
-
-.chart-box {
-
-    width: 100%;
-
-    min-height: 400px;
-
-    margin-top: 20px;
-}
-
-canvas {
-
-    width: 100% !important;
-
-    height: 400px !important;
-}
-
-
-/* TABLE */
-
-.table-wrap {
-
-    overflow-x:
-        auto;
-}
-
-table {
-
-    width: 100%;
-
-    border-collapse:
-        collapse;
-
-    font-size: 12px;
-}
-
-th {
-
-    padding:
-        14px;
-
-    text-align:
-        left;
-
-    color:
-        #7d8ba0;
-
-    background:
-        #f5f8fc;
-}
-
-td {
-
-    padding:
-        15px 14px;
-
-    border-bottom:
-        1px solid #edf1f6;
-}
-
-tr:hover td {
-
-    background:
-        #f9fbfe;
+    color: #17263b;
 }
 
 
 /* =====================================================
-   LIVE CAMERA
+   EMPTY
 ===================================================== */
 
-.live-layout {
+.empty {
+    padding: 45px 20px;
 
-    display: grid;
+    text-align: center;
 
-    grid-template-columns:
-        1.7fr .6fr;
+    color: #8491a3;
 
-    gap: 20px;
-}
-
-.camera {
-
-    min-height:
-        500px;
-
-    border-radius:
-        22px;
-
-    overflow:
-        hidden;
-
-    background:
-        #07111e;
-
-    position:
-        relative;
-
-    display:
-        grid;
-
-    place-items:
-        center;
-
-    box-shadow:
-        0 20px 50px
-        rgba(20,45,80,.18);
-}
-
-.camera img {
-
-    width: 100%;
-
-    height: 100%;
-
-    object-fit:
-        contain;
-}
-
-.camera-placeholder {
-
-    color:
-        #8d9db2;
-
-    text-align:
-        center;
-}
-
-.live-badge {
-
-    position:
-        absolute;
-
-    top: 15px;
-    left: 15px;
-
-    z-index: 5;
-
-    padding:
-        8px 12px;
-
-    border-radius:
-        999px;
-
-    background:
-        white;
-
-    color:
-        #15a66a;
-
-    font-size:
-        11px;
-
-    font-weight:
-        800;
-}
-
-.live-dot {
-
-    display:
-        inline-block;
-
-    width: 8px;
-    height: 8px;
-
-    border-radius:
-        50%;
-
-    background:
-        #21c47b;
-
-    margin-right:
-        5px;
-}
-
-.live-stats {
-
-    display:
-        flex;
-
-    flex-direction:
-        column;
-
-    gap:
-        14px;
-}
-
-.live-stat {
-
-    background:
-        white;
-
-    border:
-        1px solid #e0e8f1;
-
-    border-radius:
-        18px;
-
-    padding:
-        20px;
-
-    box-shadow:
-        0 10px 30px
-        rgba(38,77,125,.06);
-}
-
-.live-stat-label {
-
-    color:
-        #8290a4;
-
-    font-size:
-        11px;
-}
-
-.live-stat-value {
-
-    margin-top:
-        7px;
-
-    font-size:
-        25px;
-
-    font-weight:
-        800;
+    font-size: 15px;
 }
 
 
 /* =====================================================
-   FOOTER
+   RESPONSIVE
 ===================================================== */
 
-.footer {
-
-    padding:
-        25px;
-
-    text-align:
-        center;
-
-    color:
-        #94a1b2;
-
-    font-size:
-        10px;
-}
-
-
-/* =====================================================
-   MOBILE
-===================================================== */
-
-@media(max-width:1000px) {
+@media (max-width: 1050px) {
 
     .sidebar {
-
-        width:
-            80px;
-
-        padding:
-            20px 10px;
-    }
-
-    .brand {
-
-        justify-content:
-            center;
-    }
-
-    .brand-title,
-    .brand-sub {
-
-        display:
-            none;
-    }
-
-    .brand-icon {
-
-        width:
-            45px;
-
-        height:
-            45px;
-    }
-
-    .menu-item {
-
-        justify-content:
-            center;
-    }
-
-    .menu-item span:not(.menu-icon) {
-
-        display:
-            none;
-    }
-
-    .sidebar-bottom {
-
-        display:
-            none;
+        width: 215px;
     }
 
     .main {
-
-        margin-left:
-            80px;
+        margin-left: 215px;
     }
 
-    .stats-layout {
-
+    .kpi-grid,
+    .shrimp-grid {
         grid-template-columns:
-            1fr;
+            repeat(2, 1fr);
     }
 
     .quick-grid {
-
         grid-template-columns:
-            repeat(2,1fr);
+            repeat(2, 1fr);
     }
 
-    .live-layout {
-
-        grid-template-columns:
-            1fr;
+    .live-grid {
+        grid-template-columns: 1fr;
     }
 }
 
 
-@media(max-width:650px) {
+@media (max-width: 760px) {
 
     .sidebar {
+        position: relative;
 
-        width:
-            64px;
+        width: 100%;
+
+        height: auto;
+
+        border-right: 0;
+
+        border-bottom:
+            1px solid #dce6ef;
+    }
+
+    .nav {
+        display: grid;
+
+        grid-template-columns:
+            repeat(2, 1fr);
+    }
+
+    .sidebar-footer {
+        display: none;
     }
 
     .main {
-
-        margin-left:
-            64px;
-    }
-
-    .content {
-
-        width:
-            calc(100% - 24px);
-
-        padding-top:
-            25px;
+        margin-left: 0;
     }
 
     .topbar {
-
         padding:
-            0 12px;
+            0 17px;
     }
 
-    .top-heading {
+    .content {
+        width:
+            calc(100% - 30px);
 
-        font-size:
-            14px;
+        padding-top: 28px;
     }
 
-    .welcome h1 {
-
-        font-size:
-            23px;
+    .page-head h1 {
+        font-size: 28px;
     }
 
-    .ai-card {
-
-        padding:
-            20px;
-    }
-
-    .kpi-grid {
-
-        grid-template-columns:
-            1fr;
-    }
-
+    .kpi-grid,
+    .shrimp-grid,
     .quick-grid {
-
-        grid-template-columns:
-            1fr 1fr;
+        grid-template-columns: 1fr;
     }
 
-    .camera {
+    .status-bar {
+        align-items: flex-start;
 
-        min-height:
-            300px;
+        flex-direction: column;
+    }
+
+    .status-pill {
+        width: 100%;
+
+        text-align: center;
+    }
+
+    .chart-area {
+        height: 350px;
     }
 }
 """
 
 
 # =========================================================
-# LAYOUT
+# BASE HTML
 # =========================================================
 
-def navbar(active="home"):
+def layout(content, active="dashboard"):
 
-    items = [
-
-        ("home", "/", "⌂", "หน้าหลัก"),
-
-        ("daily", "/daily", "▥", "รายวัน"),
-
-        ("monthly", "/monthly", "◈", "รายเดือน"),
-
-        ("yearly", "/yearly", "▥", "รายปี"),
-
-        ("live", "/live", "◉", "Live Camera"),
-    ]
-
-    menu = ""
-
-    for key, url, icon, name in items:
-
-        active_class = (
-            "active"
-            if key == active
-            else ""
-        )
-
-        menu += f"""
-        <a
-            href="{url}"
-            class="menu-item {active_class}"
-        >
-            <span class="menu-icon">
-                {icon}
-            </span>
-
-            <span>
-                {name}
-            </span>
-        </a>
-        """
-
-    return f"""
-
-    <aside class="sidebar">
-
-        <div class="brand">
-
-            <div class="brand-icon">
-                🦐
-            </div>
-
-            <div>
-
-                <div class="brand-title">
-                    Shrimp AI
-                </div>
-
-                <div class="brand-sub">
-                    Intelligent Factory
-                </div>
-
-            </div>
-
-        </div>
-
-
-        <div class="sidebar-menu">
-
-            {menu}
-
-        </div>
-
-
-        <div class="sidebar-bottom">
-
-            <button
-                class="mode-button"
-                onclick="toggleMode()"
-            >
-                ☼ &nbsp; โหมดสว่าง
-            </button>
-
-            <div class="logout">
-                ↪ &nbsp; ระบบออนไลน์
-            </div>
-
-        </div>
-
-    </aside>
-
-
-    <header class="topbar">
-
-        <div class="top-info">
-
-            <div class="top-label">
-                SHRIMP AI FACTORY
-            </div>
-
-            <div class="top-heading">
-                ระบบคัดแยกกุ้งอัจฉริยะ
-            </div>
-
-        </div>
-
-
-        <div class="top-actions">
-
-            <button
-                class="top-button"
-                onclick="toggleMode()"
-            >
-                ☼
-            </button>
-
-            <button class="top-button">
-                ♧
-            </button>
-
-            <div class="avatar">
-                AI
-            </div>
-
-        </div>
-
-    </header>
-    """
-
-
-def page(
-    title,
-    content,
-    active="home",
-    script=""
-):
+    def nav_class(name):
+        return "active" if active == name else ""
 
     return f"""
 <!DOCTYPE html>
@@ -2027,12 +1441,10 @@ def page(
 
 <meta
     name="viewport"
-    content="width=device-width,initial-scale=1.0"
+    content="width=device-width, initial-scale=1.0"
 >
 
-<title>
-    {title} - Shrimp AI Factory
-</title>
+<title>AI Shrimp Sorting System</title>
 
 <style>
 {CSS}
@@ -2042,40 +1454,109 @@ def page(
 
 <body>
 
-{navbar(active)}
+<aside class="sidebar">
 
-<div class="main">
+    <div class="logo">
 
-    <main class="content">
+        <div class="logo-box">
+            🦐
+        </div>
+
+        <div>
+            <div class="logo-title">
+                AI Shrimp
+            </div>
+
+            <div class="logo-sub">
+                Sorting Control System
+            </div>
+        </div>
+
+    </div>
+
+
+    <nav class="nav">
+
+        <a href="/" class="{nav_class("dashboard")}">
+            <span class="nav-icon">⌂</span>
+            <span>หน้าหลัก</span>
+        </a>
+
+        <a href="/daily" class="{nav_class("daily")}">
+            <span class="nav-icon">▥</span>
+            <span>สถิติรายวัน</span>
+        </a>
+
+        <a href="/monthly" class="{nav_class("monthly")}">
+            <span class="nav-icon">▤</span>
+            <span>สถิติรายเดือน</span>
+        </a>
+
+        <a href="/yearly" class="{nav_class("yearly")}">
+            <span class="nav-icon">▦</span>
+            <span>สถิติรายปี</span>
+        </a>
+
+        <a href="/live" class="{nav_class("live")}">
+            <span class="nav-icon">▣</span>
+            <span>กล้อง Real-time</span>
+        </a>
+
+    </nav>
+
+
+    <div class="sidebar-footer">
+
+        <div class="footer-status">
+            ● ระบบ AI พร้อมทำงาน
+        </div>
+
+    </div>
+
+</aside>
+
+
+<main class="main">
+
+    <header class="topbar">
+
+        <div>
+            <div class="top-label">
+                AI SHRIMP SORTING
+            </div>
+
+            <div class="top-title">
+                ระบบควบคุมการคัดแยกกุ้ง
+            </div>
+        </div>
+
+
+        <div class="top-actions">
+
+            <button class="top-btn">
+                ☼
+            </button>
+
+            <button class="top-btn">
+                ◉
+            </button>
+
+            <div class="user-box">
+                AI
+            </div>
+
+        </div>
+
+    </header>
+
+
+    <section class="content">
 
         {content}
 
-    </main>
+    </section>
 
-    <footer class="footer">
-
-        SHRIMP AI FACTORY
-        ·
-        AI Intelligent Sorting System
-
-    </footer>
-
-</div>
-
-
-<script>
-
-function toggleMode() {{
-
-    alert(
-        "ระบบนี้ใช้โหมด Premium Light เป็นค่าเริ่มต้น"
-    );
-
-}}
-
-{script}
-
-</script>
+</main>
 
 </body>
 
@@ -2084,7 +1565,7 @@ function toggleMode() {{
 
 
 # =========================================================
-# HOME
+# DASHBOARD PAGE
 # =========================================================
 
 @app.get("/", response_class=HTMLResponse)
@@ -2092,431 +1573,427 @@ async def home():
 
     content = """
 
-    <section class="welcome">
+<div class="page-head">
 
-        <h1>
-            สวัสดีตอนเย็น 👋
-        </h1>
+    <h1>
+        ระบบคัดแยกกุ้งอัจฉริยะ
+    </h1>
 
-        <p>
-            ยินดีต้อนรับเข้าสู่ระบบ
-            Shrimp AI Factory
-        </p>
+    <p>
+        Dashboard สำหรับติดตามผลการคัดแยกด้วย AI แบบรวมศูนย์
+    </p>
 
-    </section>
+</div>
 
 
-    <section class="ai-card">
+<div class="status-bar">
 
-        <div class="ai-inner">
+    <div class="status-main">
 
-            <div class="ai-icon">
-                ✨
+        <div class="status-icon">
+            🦐
+        </div>
+
+        <div>
+
+            <div class="status-title">
+                AI Sorting System
             </div>
 
-            <div>
-
-                <div class="ai-title">
-                    คำแนะนำจาก AI
-                </div>
-
-                <div class="ai-text">
-
-                    ระบบ AI พร้อมทำงาน
-                    และกำลังติดตามผลการคัดแยกกุ้ง
-                    จากกล้องแบบเรียลไทม์
-                    สามารถตรวจสอบจำนวนกุ้ง
-                    และประสิทธิภาพของแต่ละรอบได้
-
-                </div>
-
-                <div class="ai-tags">
-
-                    <span class="ai-tag">
-                        🦐 AI Sorting
-                    </span>
-
-                    <span class="ai-tag">
-                        📷 Camera
-                    </span>
-
-                    <span class="ai-tag">
-                        📊 Analytics
-                    </span>
-
-                </div>
-
-                <a
-                    href="/live"
-                    class="ai-button"
-                >
-                    เริ่มดูระบบ
-                </a>
-
+            <div class="status-text">
+                ระบบพร้อมรับข้อมูลจากเครื่อง AI และกล้อง
             </div>
 
         </div>
 
-    </section>
+    </div>
+
+    <div class="status-pill">
+        ● SYSTEM READY
+    </div>
+
+</div>
 
 
-    <section class="stats-layout">
+<div class="kpi-grid">
 
+    <div class="kpi">
 
-        <div class="goal-card">
-
-            <div class="goal-circle">
-
-                <div class="goal-value">
-                    0%
-                </div>
-
-            </div>
-
-            <div class="goal-label">
-                เป้าหมายการคัดแยกวันนี้
-            </div>
-
+        <div class="kpi-label">
+            กุ้งทั้งหมด
         </div>
-
-
-        <div class="kpi-grid">
-
-
-            <div class="kpi-card">
-
-                <div
-                    class="kpi-icon kpi-orange"
-                >
-                    🦐
-                </div>
-
-                <div>
-
-                    <div class="kpi-label">
-                        กุ้งทั้งหมด
-                    </div>
-
-                    <div
-                        id="total"
-                        class="kpi-value"
-                    >
-                        0
-                    </div>
-
-                    <div class="kpi-sub">
-                        จากระบบ AI
-                    </div>
-
-                </div>
-
-            </div>
-
-
-            <div class="kpi-card">
-
-                <div
-                    class="kpi-icon kpi-green"
-                >
-                    ◎
-                </div>
-
-                <div>
-
-                    <div class="kpi-label">
-                        รอบการคัดแยก
-                    </div>
-
-                    <div
-                        id="rounds"
-                        class="kpi-value"
-                    >
-                        0
-                    </div>
-
-                    <div class="kpi-sub">
-                        Sorting Rounds
-                    </div>
-
-                </div>
-
-            </div>
-
-
-            <div class="kpi-card">
-
-                <div
-                    class="kpi-icon kpi-blue"
-                >
-                    ◷
-                </div>
-
-                <div>
-
-                    <div class="kpi-label">
-                        AI FPS
-                    </div>
-
-                    <div
-                        id="fps"
-                        class="kpi-value"
-                    >
-                        0
-                    </div>
-
-                    <div class="kpi-sub">
-                        Camera Performance
-                    </div>
-
-                </div>
-
-            </div>
-
-
-            <div class="kpi-card">
-
-                <div
-                    class="kpi-icon kpi-orange"
-                >
-                    ⚡
-                </div>
-
-                <div>
-
-                    <div class="kpi-label">
-                        สถานะระบบ
-                    </div>
-
-                    <div
-                        id="system"
-                        class="kpi-value"
-                    >
-                        ONLINE
-                    </div>
-
-                    <div class="kpi-sub">
-                        System Status
-                    </div>
-
-                </div>
-
-            </div>
-
-
-        </div>
-
-    </section>
-
-
-    <h2 class="section-title">
-        เมนูด่วน
-    </h2>
-
-
-    <section class="quick-grid">
-
-
-        <a
-            href="/daily"
-            class="quick-card"
-        >
-
-            <div class="quick-icon">
-                ▥
-            </div>
-
-            <div class="quick-title">
-                รายวัน
-            </div>
-
-            <div class="quick-desc">
-                Daily Analytics
-            </div>
-
-        </a>
-
-
-        <a
-            href="/monthly"
-            class="quick-card"
-        >
-
-            <div class="quick-icon green">
-                ≋
-            </div>
-
-            <div class="quick-title">
-                รายเดือน
-            </div>
-
-            <div class="quick-desc">
-                Monthly Analytics
-            </div>
-
-        </a>
-
-
-        <a
-            href="/yearly"
-            class="quick-card"
-        >
-
-            <div class="quick-icon orange">
-                ♡
-            </div>
-
-            <div class="quick-title">
-                รายปี
-            </div>
-
-            <div class="quick-desc">
-                Yearly Analytics
-            </div>
-
-        </a>
-
-
-        <a
-            href="/live"
-            class="quick-card"
-        >
-
-            <div class="quick-icon">
-                ◉
-            </div>
-
-            <div class="quick-title">
-                Live Camera
-            </div>
-
-            <div class="quick-desc">
-                ดูกล้อง AI
-            </div>
-
-        </a>
-
-
-    </section>
-
-
-    <section
-        class="panel"
-        style="margin-top:25px"
-    >
-
-        <div class="panel-title">
-            ผลการคัดแยกรอบล่าสุด
-        </div>
-
-        <div class="panel-sub">
-            Latest AI Sorting Result
-        </div>
-
 
         <div
-            class="table-wrap"
-            style="margin-top:20px"
+            class="kpi-value"
+            id="total"
         >
+            0
+        </div>
 
-            <table>
+        <div class="kpi-unit">
+            ตัว
+        </div>
 
-                <thead>
+    </div>
 
-                    <tr>
 
-                        <th>
-                            รอบ
-                        </th>
+    <div class="kpi green">
 
-                        <th>
-                            กุ้งเล็ก
-                        </th>
+        <div class="kpi-label">
+            กุ้งที่คัดแยกแล้ว
+        </div>
 
-                        <th>
-                            กุ้งกลาง
-                        </th>
+        <div
+            class="kpi-value"
+            id="sorted"
+        >
+            0
+        </div>
 
-                        <th>
-                            กุ้งใหญ่
-                        </th>
+        <div class="kpi-unit">
+            จากรอบล่าสุด
+        </div>
 
-                        <th>
-                            กุ้งป่วย
-                        </th>
+    </div>
 
-                        <th>
-                            รวม
-                        </th>
 
-                    </tr>
+    <div class="kpi orange">
 
-                </thead>
+        <div class="kpi-label">
+            จำนวนรอบ
+        </div>
 
-                <tbody id="latestTable">
+        <div
+            class="kpi-value"
+            id="rounds"
+        >
+            0
+        </div>
 
-                    <tr>
+        <div class="kpi-unit">
+            รอบทั้งหมด
+        </div>
 
-                        <td colspan="6">
-                            กำลังโหลดข้อมูล...
-                        </td>
+    </div>
 
-                    </tr>
 
-                </tbody>
+    <div class="kpi red">
 
-            </table>
+        <div class="kpi-label">
+            กุ้งป่วย
+        </div>
+
+        <div
+            class="kpi-value"
+            id="sick"
+        >
+            0
+        </div>
+
+        <div class="kpi-unit">
+            ตัว
+        </div>
+
+    </div>
+
+</div>
+
+
+<div class="section-title">
+    ผลการคัดแยกกุ้ง
+</div>
+
+
+<div class="shrimp-grid">
+
+    <div class="shrimp-card">
+
+        <div class="shrimp-header">
+
+            <div class="shrimp-name">
+                กุ้งเล็ก
+            </div>
+
+            <div class="shrimp-square"></div>
 
         </div>
 
-    </section>
+        <div
+            class="shrimp-number"
+            id="small"
+        >
+            0
+        </div>
 
-    """
+        <div class="shrimp-unit">
+            ตัว
+        </div>
+
+    </div>
 
 
-    script = r"""
+    <div class="shrimp-card">
+
+        <div class="shrimp-header">
+
+            <div class="shrimp-name">
+                กุ้งกลาง
+            </div>
+
+            <div class="shrimp-square medium"></div>
+
+        </div>
+
+        <div
+            class="shrimp-number"
+            id="medium"
+        >
+            0
+        </div>
+
+        <div class="shrimp-unit">
+            ตัว
+        </div>
+
+    </div>
+
+
+    <div class="shrimp-card">
+
+        <div class="shrimp-header">
+
+            <div class="shrimp-name">
+                กุ้งใหญ่
+            </div>
+
+            <div class="shrimp-square large"></div>
+
+        </div>
+
+        <div
+            class="shrimp-number"
+            id="large"
+        >
+            0
+        </div>
+
+        <div class="shrimp-unit">
+            ตัว
+        </div>
+
+    </div>
+
+
+    <div class="shrimp-card">
+
+        <div class="shrimp-header">
+
+            <div class="shrimp-name">
+                กุ้งป่วย
+            </div>
+
+            <div class="shrimp-square sick"></div>
+
+        </div>
+
+        <div
+            class="shrimp-number"
+            id="sickCard"
+        >
+            0
+        </div>
+
+        <div class="shrimp-unit">
+            ตัว
+        </div>
+
+    </div>
+
+</div>
+
+
+<div class="panel">
+
+    <div class="panel-head">
+
+        <div>
+
+            <div class="panel-title">
+                รอบการคัดแยกล่าสุด
+            </div>
+
+            <div class="panel-sub">
+                ข้อมูลที่ได้รับล่าสุดจากเครื่อง AI
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <div class="table-wrap">
+
+        <table>
+
+            <thead>
+
+                <tr>
+                    <th>รอบ</th>
+                    <th>กุ้งทั้งหมด</th>
+                    <th>FPS เฉลี่ย</th>
+                    <th>จำนวนเฟรม</th>
+                    <th>เวลา</th>
+                </tr>
+
+            </thead>
+
+            <tbody id="latestTable">
+
+                <tr>
+                    <td colspan="5">
+                        <div class="empty">
+                            ยังไม่มีข้อมูล
+                        </div>
+                    </td>
+                </tr>
+
+            </tbody>
+
+        </table>
+
+    </div>
+
+</div>
+
+
+<div class="section-title">
+    เมนูระบบ
+</div>
+
+
+<div class="quick-grid">
+
+    <a class="quick-card" href="/daily">
+
+        <div class="quick-no">
+            01
+        </div>
+
+        <div class="quick-title">
+            รายงานรายวัน
+        </div>
+
+        <div class="quick-desc">
+            ดูผลการคัดแยกในแต่ละวัน
+        </div>
+
+    </a>
+
+
+    <a class="quick-card" href="/monthly">
+
+        <div class="quick-no">
+            02
+        </div>
+
+        <div class="quick-title">
+            รายงานรายเดือน
+        </div>
+
+        <div class="quick-desc">
+            วิเคราะห์ข้อมูลรายเดือน
+        </div>
+
+    </a>
+
+
+    <a class="quick-card" href="/yearly">
+
+        <div class="quick-no">
+            03
+        </div>
+
+        <div class="quick-title">
+            รายงานรายปี
+        </div>
+
+        <div class="quick-desc">
+            สรุปผลการทำงานรายปี
+        </div>
+
+    </a>
+
+
+    <a class="quick-card" href="/live">
+
+        <div class="quick-no">
+            04
+        </div>
+
+        <div class="quick-title">
+            กล้อง Real-time
+        </div>
+
+        <div class="quick-desc">
+            ดูภาพจากเครื่อง AI แบบสด
+        </div>
+
+    </a>
+
+</div>
+
+
+<script>
 
 async function loadDashboard() {
 
     try {
 
-        const response =
-            await fetch(
-                "/api/dashboard"
-            );
+        const res =
+            await fetch("/api/dashboard");
 
         const data =
-            await response.json();
+            await res.json();
 
         const counts =
-            data.counts || {};
+            data.totals || {};
 
-        const latest =
-            data.latest_round || {};
+        const total =
+            data.total || 0;
+
+        document.getElementById("total")
+            .textContent = total;
+
+        document.getElementById("sorted")
+            .textContent = total;
+
+        document.getElementById("rounds")
+            .textContent =
+                data.rounds || 0;
+
+        document.getElementById("sick")
+            .textContent =
+                counts["กุ้งป่วย"] || 0;
+
+        document.getElementById("small")
+            .textContent =
+                counts["กุ้งเล็ก"] || 0;
+
+        document.getElementById("medium")
+            .textContent =
+                counts["กุ้งกลาง"] || 0;
+
+        document.getElementById("large")
+            .textContent =
+                counts["กุ้งใหญ่"] || 0;
+
+        document.getElementById("sickCard")
+            .textContent =
+                counts["กุ้งป่วย"] || 0;
 
 
-        document.getElementById(
-            "total"
-        ).textContent =
-            Number(
-                data.total || 0
-            ).toLocaleString();
-
-
-        document.getElementById(
-            "rounds"
-        ).textContent =
-            Number(
-                data.rounds || 0
-            ).toLocaleString();
-
-
-        document.getElementById(
-            "fps"
-        ).textContent =
-            Number(
-                latest.avg_fps || 0
-            ).toFixed(1);
-
+        const round =
+            data.latest_round;
 
         const table =
             document.getElementById(
@@ -2524,43 +2001,53 @@ async function loadDashboard() {
             );
 
 
+        if (!round) {
+
+            table.innerHTML = `
+                <tr>
+                    <td colspan="5">
+                        <div class="empty">
+                            ยังไม่มีข้อมูลจากเครื่อง AI
+                        </div>
+                    </td>
+                </tr>
+            `;
+
+            return;
+        }
+
+
         table.innerHTML = `
 
             <tr>
 
                 <td>
-                    #${latest.round_id ?? "-"}
+                    #${round.round_id}
                 </td>
 
                 <td>
-                    ${counts["กุ้งเล็ก"] || 0}
+                    ${total}
                 </td>
 
                 <td>
-                    ${counts["กุ้งกลาง"] || 0}
+                    ${Number(
+                        round.avg_fps || 0
+                    ).toFixed(1)}
                 </td>
 
                 <td>
-                    ${counts["กุ้งใหญ่"] || 0}
+                    ${round.frames || 0}
                 </td>
 
                 <td>
-                    ${counts["กุ้งป่วย"] || 0}
-                </td>
-
-                <td>
-                    <b>
-                        ${data.total || 0}
-                    </b>
+                    ${round.finished_at || "-"}
                 </td>
 
             </tr>
 
         `;
 
-    }
-
-    catch(error) {
+    } catch (error) {
 
         console.error(error);
 
@@ -2576,13 +2063,13 @@ setInterval(
     3000
 );
 
-    """
+</script>
 
-    return page(
-        "Dashboard",
+"""
+
+    return layout(
         content,
-        "home",
-        script
+        "dashboard"
     )
 
 
@@ -2590,256 +2077,107 @@ setInterval(
 # ANALYTICS PAGE
 # =========================================================
 
-def analytics_page(
-    title,
-    endpoint,
-    active,
-    description
-):
+def analytics_page(mode):
+
+    titles = {
+        "daily": "สถิติการคัดแยกรายวัน",
+        "monthly": "สถิติการคัดแยกรายเดือน",
+        "yearly": "สถิติการคัดแยกรายปี"
+    }
+
+    descriptions = {
+        "daily":
+            "แสดงจำนวนกุ้งแต่ละประเภทที่คัดแยกได้ในแต่ละวัน",
+
+        "monthly":
+            "แสดงจำนวนกุ้งแต่ละประเภทที่คัดแยกได้ในแต่ละเดือน",
+
+        "yearly":
+            "แสดงจำนวนกุ้งแต่ละประเภทที่คัดแยกได้ในแต่ละปี"
+    }
+
+    endpoint = f"/api/analytics/{mode}"
 
     content = f"""
 
-    <section class="page-title">
-
-        <a
-            href="/"
-            class="back"
-        >
-            ← กลับหน้าหลัก
-        </a>
-
-        <h1>
-            {title}
-        </h1>
-
-        <p>
-            {description}
-        </p>
-
-    </section>
+<a
+    class="back"
+    href="/"
+>
+    ← กลับหน้าหลัก
+</a>
 
 
-    <section class="panel">
+<div class="page-head">
 
-        <div class="panel-title">
-            Shrimp Sorting Analytics
-        </div>
+    <h1>
+        {titles[mode]}
+    </h1>
 
-        <div class="panel-sub">
-            จำนวนกุ้งที่ระบบ AI ตรวจพบ
-        </div>
+    <p>
+        {descriptions[mode]}
+    </p>
 
-
-        <div class="chart-box">
-
-            <canvas id="chart"></canvas>
-
-        </div>
-
-    </section>
+</div>
 
 
-    <section class="panel">
+<div class="chart-panel">
 
-        <div class="panel-title">
-            รายละเอียดข้อมูล
-        </div>
+    <div class="panel-head">
 
-        <div class="panel-sub">
-            Sorting History
-        </div>
+        <div>
 
+            <div class="panel-title">
+                จำนวนกุ้งที่คัดแยก
+            </div>
 
-        <div
-            class="table-wrap"
-            style="margin-top:20px"
-        >
-
-            <table>
-
-                <thead>
-
-                    <tr>
-
-                        <th>
-                            ช่วงเวลา
-                        </th>
-
-                        <th>
-                            กุ้งเล็ก
-                        </th>
-
-                        <th>
-                            กุ้งกลาง
-                        </th>
-
-                        <th>
-                            กุ้งใหญ่
-                        </th>
-
-                        <th>
-                            กุ้งป่วย
-                        </th>
-
-                        <th>
-                            รวม
-                        </th>
-
-                        <th>
-                            รอบ
-                        </th>
-
-                    </tr>
-
-                </thead>
-
-                <tbody id="analyticsTable">
-
-                    <tr>
-                        <td colspan="7">
-                            กำลังโหลด...
-                        </td>
-                    </tr>
-
-                </tbody>
-
-            </table>
+            <div class="panel-sub">
+                แยกตามประเภทกุ้ง
+            </div>
 
         </div>
 
-    </section>
-
-    """
+    </div>
 
 
-    script = f"""
+    <div class="chart-area">
 
-let analyticsData = [];
+        <canvas id="chart"></canvas>
 
+    </div>
 
-async function loadAnalytics() {{
-
-    try {{
-
-        const response =
-            await fetch(
-                "{endpoint}"
-            );
-
-        const result =
-            await response.json();
-
-        analyticsData =
-            result.data || [];
+</div>
 
 
-        renderTable();
+<script>
 
-        drawChart();
+const endpoint =
+    "{endpoint}";
 
-    }}
+const canvas =
+    document.getElementById("chart");
 
-    catch(error) {{
-
-        console.error(error);
-
-    }}
-
-}}
+const ctx =
+    canvas.getContext("2d");
 
 
-function renderTable(){{
+async function loadChart() {
 
-    const table =
-        document.getElementById(
-            "analyticsTable"
-        );
+    const res =
+        await fetch(endpoint);
 
+    const result =
+        await res.json();
 
-    if(!analyticsData.length){{
-
-        table.innerHTML = `
-
-            <tr>
-
-                <td colspan="7">
-                    ยังไม่มีข้อมูล
-                </td>
-
-            </tr>
-
-        `;
-
-        return;
-
-    }}
-
-
-    table.innerHTML =
-
-        analyticsData
-        .slice()
-        .reverse()
-        .map(row => `
-
-            <tr>
-
-                <td>
-                    <b>
-                        ${{row.label}}
-                    </b>
-                </td>
-
-                <td>
-                    ${{row["กุ้งเล็ก"]}}
-                </td>
-
-                <td>
-                    ${{row["กุ้งกลาง"]}}
-                </td>
-
-                <td>
-                    ${{row["กุ้งใหญ่"]}}
-                </td>
-
-                <td>
-                    ${{row["กุ้งป่วย"]}}
-                </td>
-
-                <td>
-                    <b>
-                        ${{row.total}}
-                    </b>
-                </td>
-
-                <td>
-                    ${{row.rounds}}
-                </td>
-
-            </tr>
-
-        `)
-        .join("");
-
-}}
-
-
-function drawChart(){{
-
-    const canvas =
-        document.getElementById(
-            "chart"
-        );
-
-    const ctx =
-        canvas.getContext("2d");
+    const data =
+        result.data || [];
 
 
     const width =
         canvas.clientWidth;
 
     const height =
-        400;
+        canvas.clientHeight;
 
     const dpr =
         window.devicePixelRatio || 1;
@@ -2851,10 +2189,13 @@ function drawChart(){{
     canvas.height =
         height * dpr;
 
-
-    ctx.scale(
+    ctx.setTransform(
         dpr,
-        dpr
+        0,
+        0,
+        dpr,
+        0,
+        0
     );
 
 
@@ -2866,13 +2207,13 @@ function drawChart(){{
     );
 
 
-    if(!analyticsData.length){{
+    if (!data.length) {
 
         ctx.fillStyle =
-            "#8492a5";
+            "#8391a3";
 
         ctx.font =
-            "14px Arial";
+            "16px Arial";
 
         ctx.textAlign =
             "center";
@@ -2884,172 +2225,169 @@ function drawChart(){{
         );
 
         return;
+    }
 
-    }}
 
+    const left =
+        65;
 
-    const padding = {{
+    const right =
+        25;
 
-        top: 30,
+    const top =
+        30;
 
-        right: 20,
-
-        bottom: 55,
-
-        left: 55
-
-    }};
+    const bottom =
+        65;
 
 
     const chartWidth =
-        width -
-        padding.left -
-        padding.right;
-
+        width - left - right;
 
     const chartHeight =
-        height -
-        padding.top -
-        padding.bottom;
+        height - top - bottom;
 
 
-    const maxValue =
-        Math.max(
-            ...analyticsData.map(
-                x => x.total
-            ),
-            10
-        );
+    let maxValue = 0;
+
+    data.forEach(item => {
+
+        SHRIMP_TYPES.forEach(type => {
+
+            maxValue =
+                Math.max(
+                    maxValue,
+                    Number(
+                        item[type] || 0
+                    )
+                );
+
+        });
+
+    });
 
 
-    const niceMax =
-        Math.ceil(
-            maxValue / 10
-        ) * 10;
+    if (maxValue <= 0)
+        maxValue = 10;
 
 
-    for(
+    const steps = 5;
+
+
+    /* GRID */
+
+    ctx.strokeStyle =
+        "#e8eef5";
+
+    ctx.lineWidth = 1;
+
+    ctx.font =
+        "12px Arial";
+
+    ctx.fillStyle =
+        "#7b899b";
+
+    ctx.textAlign =
+        "right";
+
+
+    for (
         let i = 0;
-        i <= 5;
+        i <= steps;
         i++
-    ){{
+    ) {
 
         const value =
-            niceMax * i / 5;
-
+            maxValue *
+            i /
+            steps;
 
         const y =
-            padding.top +
+            top +
             chartHeight -
             (
                 value /
-                niceMax
+                maxValue
             ) *
             chartHeight;
 
 
-        ctx.strokeStyle =
-            "#e8eef5";
-
         ctx.beginPath();
 
         ctx.moveTo(
-            padding.left,
+            left,
             y
         );
 
         ctx.lineTo(
-            width -
-            padding.right,
+            width - right,
             y
         );
 
         ctx.stroke();
 
 
-        ctx.fillStyle =
-            "#8a98a9";
-
-        ctx.font =
-            "10px Arial";
-
-        ctx.textAlign =
-            "right";
-
         ctx.fillText(
             Math.round(value),
-            padding.left - 10,
+            left - 10,
             y + 4
         );
 
-    }}
+    }
+
+
+    /* BAR */
+
+    const colors = [
+        "#247ce4",
+        "#20aa76",
+        "#efa52b",
+        "#df5e69"
+    ];
 
 
     const groupWidth =
         chartWidth /
-        analyticsData.length;
+        data.length;
+
+    const barWidth =
+        Math.min(
+            25,
+            groupWidth / 6
+        );
 
 
-    const types = [
+    data.forEach(
+        (item, index) => {
 
-        "กุ้งเล็ก",
-
-        "กุ้งกลาง",
-
-        "กุ้งใหญ่",
-
-        "กุ้งป่วย"
-
-    ];
-
-
-    const colors = [
-
-        "#38b978",
-
-        "#4388ed",
-
-        "#f4a62a",
-
-        "#ee626e"
-
-    ];
-
-
-    analyticsData.forEach(
-        (row, index) => {{
-
-            const center =
-                padding.left +
+            const xCenter =
+                left +
                 groupWidth *
                 index +
                 groupWidth / 2;
 
 
-            const barWidth =
-                Math.min(
-                    16,
-                    groupWidth / 7
-                );
-
-
-            types.forEach(
-                (type, typeIndex) => {{
+            SHRIMP_TYPES.forEach(
+                (type, typeIndex) => {
 
                     const value =
-                        row[type] || 0;
+                        Number(
+                            item[type] || 0
+                        );
 
 
                     const barHeight =
-                        value /
-                        niceMax *
+                        (
+                            value /
+                            maxValue
+                        ) *
                         chartHeight;
 
 
                     const x =
-                        center -
+                        xCenter -
                         (
-                            types.length *
+                            SHRIMP_TYPES.length *
                             barWidth
                         ) / 2 +
                         typeIndex *
@@ -3057,7 +2395,7 @@ function drawChart(){{
 
 
                     const y =
-                        padding.top +
+                        top +
                         chartHeight -
                         barHeight;
 
@@ -3066,284 +2404,296 @@ function drawChart(){{
                         colors[typeIndex];
 
 
-                    ctx.beginPath();
-
-                    ctx.roundRect(
+                    ctx.fillRect(
                         x,
                         y,
-                        barWidth - 2,
-                        barHeight,
-                        4
+                        barWidth - 3,
+                        barHeight
                     );
 
-                    ctx.fill();
-
-                }}
+                }
             );
 
 
             ctx.fillStyle =
-                "#8592a4";
+                "#69788c";
 
             ctx.font =
-                "10px Arial";
+                "11px Arial";
 
             ctx.textAlign =
                 "center";
 
 
-            let label =
-                row.label;
-
-
-            if(label.length > 10){{
-
-                label =
-                    label.substring(5);
-
-            }}
-
-
             ctx.fillText(
-                label,
-                center,
-                height - 22
+                item.period,
+                xCenter,
+                height - 28
             );
 
-        }}
+        }
     );
 
-}}
 
+    /* LEGEND */
+
+    const legendY =
+        12;
+
+    let legendX =
+        left;
+
+
+    SHRIMP_TYPES.forEach(
+        (type, index) => {
+
+            ctx.fillStyle =
+                colors[index];
+
+            ctx.fillRect(
+                legendX,
+                legendY,
+                12,
+                12
+            );
+
+            ctx.fillStyle =
+                "#526176";
+
+            ctx.font =
+                "12px Arial";
+
+            ctx.textAlign =
+                "left";
+
+            ctx.fillText(
+                type,
+                legendX + 17,
+                legendY + 10
+            );
+
+            legendX +=
+                95 +
+                type.length * 2;
+
+        }
+    );
+
+}
+
+
+loadChart();
 
 window.addEventListener(
     "resize",
-    drawChart
+    loadChart
 );
 
+</script>
 
-loadAnalytics();
+"""
 
-setInterval(
-    loadAnalytics,
-    5000
-);
-
-    """
-
-
-    return page(
-        title,
+    return layout(
         content,
-        active,
-        script
+        mode
     )
 
 
-# =========================================================
-# DAILY
-# =========================================================
-
-@app.get(
-    "/daily",
-    response_class=HTMLResponse
-)
-async def daily_page():
-
-    return analytics_page(
-
-        "รายวัน",
-
-        "/api/analytics/daily",
-
-        "daily",
-
-        "สรุปผลการคัดแยกกุ้งในแต่ละวัน"
-    )
+@app.get("/daily", response_class=HTMLResponse)
+async def daily():
+    return analytics_page("daily")
 
 
-# =========================================================
-# MONTHLY
-# =========================================================
-
-@app.get(
-    "/monthly",
-    response_class=HTMLResponse
-)
-async def monthly_page():
-
-    return analytics_page(
-
-        "รายเดือน",
-
-        "/api/analytics/monthly",
-
-        "monthly",
-
-        "สรุปผลการคัดแยกกุ้งในแต่ละเดือน"
-    )
+@app.get("/monthly", response_class=HTMLResponse)
+async def monthly():
+    return analytics_page("monthly")
 
 
-# =========================================================
-# YEARLY
-# =========================================================
-
-@app.get(
-    "/yearly",
-    response_class=HTMLResponse
-)
-async def yearly_page():
-
-    return analytics_page(
-
-        "รายปี",
-
-        "/api/analytics/yearly",
-
-        "yearly",
-
-        "สรุปผลการคัดแยกกุ้งในแต่ละปี"
-    )
+@app.get("/yearly", response_class=HTMLResponse)
+async def yearly():
+    return analytics_page("yearly")
 
 
 # =========================================================
 # LIVE PAGE
 # =========================================================
 
-@app.get(
-    "/live",
-    response_class=HTMLResponse
-)
-async def live_page():
+@app.get("/live", response_class=HTMLResponse)
+async def live():
 
     content = """
 
-    <section class="page-title">
+<a
+    class="back"
+    href="/"
+>
+    ← กลับหน้าหลัก
+</a>
 
-        <a
-            href="/"
-            class="back"
+
+<div class="page-head">
+
+    <h1>
+        กล้อง Real-time
+    </h1>
+
+    <p>
+        ภาพจากเครื่อง AI สำหรับติดตามกระบวนการคัดแยกแบบสด
+    </p>
+
+</div>
+
+
+<div class="live-grid">
+
+
+    <div class="camera-panel">
+
+        <div
+            class="live-label"
+            id="liveStatus"
         >
-            ← กลับหน้าหลัก
-        </a>
+            ● OFFLINE
+        </div>
 
-        <h1>
-            Live Camera
-        </h1>
+        <img
+            id="camera"
+            alt="AI Camera"
+        >
 
-        <p>
-            ดูภาพจากกล้อง AI แบบเรียลไทม์
-        </p>
+        <div
+            class="camera-empty"
+            id="cameraEmpty"
+        >
+            กำลังรอภาพจากเครื่อง AI
+        </div>
 
-    </section>
+    </div>
 
 
-    <section class="live-layout">
+    <div class="live-info">
+
+        <h2>
+            สถานะระบบ
+        </h2>
 
 
-        <div class="camera">
+        <div class="live-stat">
 
-            <div
-                id="liveBadge"
-                class="live-badge"
-            >
-                <span class="live-dot"></span>
-                CAMERA ONLINE
+            <div class="live-stat-label">
+                สถานะกล้อง
             </div>
 
-
-            <img
-                id="camera"
-                src="/api/live/frame"
-                alt="AI Camera"
-            >
-
-
             <div
-                id="placeholder"
-                class="camera-placeholder"
+                class="live-stat-value"
+                id="status"
             >
-
-                <div
-                    style="
-                    font-size:55px;
-                    margin-bottom:10px;
-                    "
-                >
-                    📷
-                </div>
-
-                <div>
-                    กำลังรอภาพจากกล้อง AI...
-                </div>
-
+                OFFLINE
             </div>
 
         </div>
 
 
-        <div class="live-stats">
+        <div class="live-stat">
 
-
-            <div class="live-stat">
-
-                <div class="live-stat-label">
-                    CAMERA STATUS
-                </div>
-
-                <div
-                    id="status"
-                    class="live-stat-value"
-                >
-                    OFFLINE
-                </div>
-
+            <div class="live-stat-label">
+                FPS
             </div>
 
-
-            <div class="live-stat">
-
-                <div class="live-stat-label">
-                    AI FPS
-                </div>
-
-                <div
-                    id="liveFps"
-                    class="live-stat-value"
-                >
-                    0
-                </div>
-
+            <div
+                class="live-stat-value"
+                id="fps"
+            >
+                0
             </div>
-
-
-            <div class="live-stat">
-
-                <div class="live-stat-label">
-                    LAST UPDATE
-                </div>
-
-                <div
-                    id="lastUpdate"
-                    class="live-stat-value"
-                    style="font-size:15px"
-                >
-                    -
-                </div>
-
-            </div>
-
 
         </div>
 
-    </section>
 
-    """
+        <div class="live-stat">
+
+            <div class="live-stat-label">
+                อัปเดตล่าสุด
+            </div>
+
+            <div
+                class="live-stat-value"
+                id="lastUpdate"
+                style="font-size:16px;"
+            >
+                -
+            </div>
+
+        </div>
+
+    </div>
+
+</div>
 
 
-    script = r"""
+<script>
 
-async function updateStatus(){
+const camera =
+    document.getElementById(
+        "camera"
+    );
+
+const empty =
+    document.getElementById(
+        "cameraEmpty"
+    );
+
+
+async function updateCamera() {
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/live/frame?t=" +
+                Date.now()
+            );
+
+
+        if (!response.ok) {
+
+            camera.style.display =
+                "none";
+
+            empty.style.display =
+                "block";
+
+            return;
+        }
+
+
+        const blob =
+            await response.blob();
+
+
+        camera.src =
+            URL.createObjectURL(blob);
+
+        camera.style.display =
+            "block";
+
+        empty.style.display =
+            "none";
+
+    } catch (error) {
+
+        camera.style.display =
+            "none";
+
+        empty.style.display =
+            "block";
+
+    }
+
+}
+
+
+async function updateStatus() {
 
     try {
 
@@ -3361,81 +2711,57 @@ async function updateStatus(){
                 "status"
             );
 
-
         const badge =
             document.getElementById(
-                "liveBadge"
+                "liveStatus"
             );
 
 
-        const placeholder =
-            document.getElementById(
-                "placeholder"
-            );
-
-
-        if(data.online){
+        if (data.online) {
 
             status.textContent =
                 "ONLINE";
 
             status.style.color =
-                "#18a66b";
+                "#20aa76";
 
-            badge.innerHTML =
-                '<span class="live-dot"></span>' +
-                'CAMERA ONLINE';
+            badge.textContent =
+                "● ONLINE";
 
-            placeholder.style.display =
-                "none";
+            badge.style.color =
+                "#20aa76";
 
-        }
-        else {
+        } else {
 
             status.textContent =
                 "OFFLINE";
 
             status.style.color =
-                "#ed5b69";
+                "#df5e69";
 
-            badge.innerHTML =
-                '<span class="live-dot" ' +
-                'style="background:#ed5b69"></span>' +
-                'CAMERA OFFLINE';
+            badge.textContent =
+                "● OFFLINE";
 
-            placeholder.style.display =
-                "block";
-
+            badge.style.color =
+                "#df5e69";
         }
 
 
         document.getElementById(
-            "liveFps"
+            "fps"
         ).textContent =
             Number(
                 data.fps || 0
             ).toFixed(1);
 
 
-        if(data.last_update){
+        document.getElementById(
+            "lastUpdate"
+        ).textContent =
+            data.last_update || "-";
 
-            const date =
-                new Date(
-                    data.last_update
-                );
 
-            document.getElementById(
-                "lastUpdate"
-            ).textContent =
-                date.toLocaleTimeString(
-                    "th-TH"
-                );
-
-        }
-
-    }
-
-    catch(error){
+    } catch (error) {
 
         console.error(error);
 
@@ -3444,64 +2770,29 @@ async function updateStatus(){
 }
 
 
-function refreshCamera(){
-
-    const camera =
-        document.getElementById(
-            "camera"
-        );
-
-    camera.src =
-        "/api/live/frame?t=" +
-        Date.now();
-
-}
-
+updateCamera();
 
 updateStatus();
 
-refreshCamera();
-
 
 setInterval(
-    updateStatus,
-    1000
-);
-
-
-setInterval(
-    refreshCamera,
+    updateCamera,
     500
 );
 
-    """
+setInterval(
+    updateStatus,
+    2000
+);
 
-    return page(
-        "Live Camera",
+</script>
+
+"""
+
+    return layout(
         content,
-        "live",
-        script
+        "live"
     )
-
-
-# =========================================================
-# HEALTH
-# =========================================================
-
-@app.get("/api/health")
-async def health():
-
-    return {
-
-        "status":
-            "ok",
-
-        "rounds":
-            len(round_history),
-
-        "live":
-            live_status["online"]
-    }
 
 
 # =========================================================
@@ -3510,11 +2801,15 @@ async def health():
 
 if __name__ == "__main__":
 
+    port = int(
+        os.getenv(
+            "PORT",
+            "10000"
+        )
+    )
+
     uvicorn.run(
-
         app,
-
         host="0.0.0.0",
-
-        port=PORT
+        port=port
     )
