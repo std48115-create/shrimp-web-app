@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ระบบตรวจจับกุ้ง AI</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', 'Tahoma', sans-serif;
+    background: #0f1720;
+    color: #e5e7eb;
+    margin: 0;
+    padding: 24px 16px;
+  }
+  .container { max-width: 800px; margin: 0 auto; }
+  h1 { font-size: 1.6rem; margin-bottom: 4px; }
+  .subtitle { color: #9ca3af; margin-bottom: 24px; font-size: 0.9rem; }
+
+  .card {
+    background: #1a2332;
+    border: 1px solid #2a3548;
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+
+  .upload-area {
+    border: 2px dashed #3b82f6;
+    border-radius: 10px;
+    padding: 32px;
+    text-align: center;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  .upload-area:hover { background: rgba(59, 130, 246, 0.08); }
+  .upload-area input[type="file"] { display: none; }
+
+  button {
+    background: #3b82f6;
+    color: white;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 24px;
+    font-size: 1rem;
+    cursor: pointer;
+    margin-top: 12px;
+  }
+  button:hover { background: #2563eb; }
+
+  .error {
+    background: rgba(239, 68, 68, 0.15);
+    border: 1px solid #ef4444;
+    color: #fca5a5;
+    padding: 10px 14px;
+    border-radius: 8px;
+    margin-bottom: 16px;
+  }
+
+  .result-img {
+    width: 100%;
+    border-radius: 10px;
+    display: block;
+    margin-bottom: 16px;
+  }
+
+  .stat-total {
+    font-size: 1.4rem;
+    font-weight: 600;
+    margin-bottom: 12px;
+  }
+
+  .class-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px;
+  }
+  .class-item {
+    background: #0f1720;
+    border-radius: 8px;
+    padding: 12px;
+    text-align: center;
+  }
+  .class-item .count { font-size: 1.5rem; font-weight: 700; }
+  .class-item .name { font-size: 0.8rem; color: #9ca3af; margin-top: 4px; }
+
+  .timestamp { color: #6b7280; font-size: 0.8rem; margin-top: 12px; }
+
+  .file-name { margin-top: 10px; color: #9ca3af; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🦐 ระบบตรวจจับกุ้ง AI</h1>
+  <p class="subtitle">อัปโหลดภาพกุ้งเพื่อตรวจจับและจำแนกชนิด</p>
+
+  {% if error %}
+  <div class="error">{{ error }}</div>
+  {% endif %}
+
+  <div class="card">
+    <form action="/predict" method="post" enctype="multipart/form-data" id="uploadForm">
+      <label class="upload-area" for="imageInput">
+        <div>📷 คลิกเพื่อเลือกภาพ หรือ ลากภาพมาวางที่นี่</div>
+        <div class="file-name" id="fileName"></div>
+        <input type="file" name="image" id="imageInput" accept="image/*" required>
+      </label>
+      <button type="submit">🔍 ตรวจจับกุ้ง</button>
+    </form>
+  </div>
+
+  {% if result %}
+  <div class="card">
+    <img src="{{ result.image_url }}" class="result-img" alt="ผลลัพธ์การตรวจจับ">
+    <div class="stat-total">พบกุ้งทั้งหมด: {{ result.total }} ตัว</div>
+    <div class="class-grid">
+      {% for name, count in result.class_counts.items() %}
+      <div class="class-item">
+        <div class="count">{{ count }}</div>
+        <div class="name">{{ name }}</div>
+      </div>
+      {% endfor %}
+    </div>
+    <div class="timestamp">ตรวจเมื่อ: {{ result.timestamp }}</div>
+  </div>
+  {% endif %}
+</div>
+
+<script>
+  document.getElementById('imageInput').addEventListener('change', function(e) {
+    const name = e.target.files[0] ? e.target.files[0].name : '';
+    document.getElementById('fileName').textContent = name;
+  });
+</script>
+</body>
+</html>
