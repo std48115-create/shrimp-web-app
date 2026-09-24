@@ -4,3 +4,5 @@ torchvision
 ultralytics
 opencv-python-headless
 gradio
+fastapi
+uvicorn
