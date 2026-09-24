@@ -1,4 +1,5 @@
-   flask
-   ultralytics
-   opencv-python-headless
-   gunicorn
+flask
+ultralytics
+opencv-python-headless
+gunicorn
+gradio
