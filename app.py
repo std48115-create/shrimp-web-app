@@ -1,19 +1,27 @@
-import os
-import base64
-from datetime import datetime
-from collections import deque
-from typing import Dict, Optional
-
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
+from collections import deque
+from datetime import datetime
+from typing import Optional
+import base64
+import os
+import uvicorn
+
+
+# =========================================================
+# APP
+# =========================================================
+
+app = FastAPI(title="Shrimp Vision AI")
 
 
 # =========================================================
 # CONFIG
 # =========================================================
 
-API_KEY = os.environ.get("API_KEY", "change-me")
+API_KEY = os.getenv("API_KEY", "change-me")
+PORT = int(os.getenv("PORT", "10000"))
 
 SHRIMP_TYPES = [
     "กุ้งเล็ก",
@@ -22,18 +30,22 @@ SHRIMP_TYPES = [
     "กุ้งป่วย",
 ]
 
-app = FastAPI(title="Shrimp Vision AI")
-
 
 # =========================================================
-# MEMORY
+# MEMORY STORAGE
 # =========================================================
 
 latest_round = None
-round_history = deque(maxlen=100)
 
-live_frame: Optional[bytes] = None
-live_ts: Optional[datetime] = None
+round_history = deque(maxlen=1000)
+
+live_frame = None
+live_ts = None
+live_info = {
+    "fps": 0,
+    "status": "offline",
+    "last_update": None,
+}
 
 
 # =========================================================
@@ -41,9 +53,9 @@ live_ts: Optional[datetime] = None
 # =========================================================
 
 class RoundReport(BaseModel):
-    round_id: int = 0
+    round_id: int
 
-    counts: Dict[str, int] = Field(default_factory=dict)
+    counts: dict[str, int] = Field(default_factory=dict)
 
     avg_fps: float = 0
     duration: float = 0
@@ -52,2999 +64,2800 @@ class RoundReport(BaseModel):
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
 
-    frame_b64: Optional[str] = None
-
 
 class LiveReport(BaseModel):
-    counts: Dict[str, int] = Field(default_factory=dict)
+    frame: str
 
     fps: float = 0
 
-    frame_b64: Optional[str] = None
+    status: str = "online"
+
+    timestamp: Optional[str] = None
 
 
 # =========================================================
 # HELPERS
 # =========================================================
 
-def clean_counts(counts: Dict[str, int]):
+def check_api_key(key: Optional[str]):
+    if key != API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key"
+        )
+
+
+def clean_counts(counts):
     result = {}
 
     for shrimp_type in SHRIMP_TYPES:
         try:
-            value = int(counts.get(shrimp_type, 0))
+            result[shrimp_type] = max(
+                0,
+                int(counts.get(shrimp_type, 0))
+            )
         except Exception:
-            value = 0
-
-        result[shrimp_type] = max(0, value)
+            result[shrimp_type] = 0
 
     return result
 
 
-def decode_frame(frame_b64: Optional[str]):
-    if not frame_b64:
-        return None
+def parse_datetime(value):
+    if not value:
+        return datetime.now()
+
+    if isinstance(value, datetime):
+        return value
+
+    value = str(value).strip()
+
+    formats = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%dT%H:%M:%S.%f",
+    ]
+
+    for fmt in formats:
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            pass
 
     try:
-        if "," in frame_b64:
-            frame_b64 = frame_b64.split(",", 1)[1]
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(
+            tzinfo=None
+        )
+    except Exception:
+        return datetime.now()
 
-        return base64.b64decode(frame_b64)
+
+def get_round_datetime(item):
+    return parse_datetime(
+        item.get("finished_at")
+        or item.get("started_at")
+        or item.get("received_at")
+    )
+
+
+def total_count(counts):
+    return sum(counts.get(x, 0) for x in SHRIMP_TYPES)
+
+
+def make_round_record(report: RoundReport):
+    counts = clean_counts(report.counts)
+
+    now = datetime.now()
+
+    return {
+        "round_id": report.round_id,
+        "counts": counts,
+        "total": total_count(counts),
+        "avg_fps": report.avg_fps,
+        "duration": report.duration,
+        "frames": report.frames,
+        "started_at": report.started_at,
+        "finished_at": report.finished_at,
+        "received_at": now.isoformat(),
+    }
+
+
+def decode_frame(frame_data):
+    if not frame_data:
+        return None
+
+    if "," in frame_data:
+        frame_data = frame_data.split(",", 1)[1]
+
+    try:
+        return base64.b64decode(frame_data)
     except Exception:
         return None
 
 
-def check_api_key(x_api_key: Optional[str]):
-    if API_KEY and API_KEY != "change-me":
-        if x_api_key != API_KEY:
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid API key"
-            )
-
-
-def no_cache(response):
-    response.headers["Cache-Control"] = "no-store"
-    return response
-
-
 # =========================================================
-# API
+# API - ROUND
 # =========================================================
-
-@app.get("/api/health")
-def health():
-    return {
-        "status": "ok",
-        "service": "Shrimp Vision AI"
-    }
-
 
 @app.post("/api/round")
-def receive_round(
-    data: RoundReport,
-    x_api_key: Optional[str] = Header(default=None)
+async def receive_round(
+    report: RoundReport,
+    x_api_key: Optional[str] = Header(None)
 ):
     global latest_round
 
     check_api_key(x_api_key)
 
-    counts = clean_counts(data.counts)
+    record = make_round_record(report)
 
-    total = sum(counts.values())
+    latest_round = record
 
-    normal_total = (
-        counts["กุ้งเล็ก"]
-        + counts["กุ้งกลาง"]
-        + counts["กุ้งใหญ่"]
-    )
-
-    sick_total = counts["กุ้งป่วย"]
-
-    result = {
-        "round_id": data.round_id,
-        "counts": counts,
-
-        "total": total,
-        "normal_total": normal_total,
-        "sick_total": sick_total,
-
-        "avg_fps": data.avg_fps,
-        "duration": data.duration,
-        "frames": data.frames,
-
-        "started_at": data.started_at,
-        "finished_at": data.finished_at,
-
-        "received_at": datetime.now().isoformat(),
-    }
-
-    latest_round = result
-
-    round_history.appendleft(result)
-
-    frame = decode_frame(data.frame_b64)
-
-    global live_frame, live_ts
-
-    if frame:
-        live_frame = frame
-        live_ts = datetime.now()
+    round_history.append(record)
 
     return {
-        "ok": True,
+        "success": True,
         "message": "Round received",
-        "round": result
+        "round_id": report.round_id,
     }
 
 
+# =========================================================
+# API - LIVE CAMERA
+# =========================================================
+
 @app.post("/api/live")
-def receive_live(
-    data: LiveReport,
-    x_api_key: Optional[str] = Header(default=None)
+async def receive_live(
+    report: LiveReport,
+    x_api_key: Optional[str] = Header(None)
 ):
-    global live_frame, live_ts
+    global live_frame
+    global live_ts
+    global live_info
 
     check_api_key(x_api_key)
 
-    frame = decode_frame(data.frame_b64)
+    decoded = decode_frame(report.frame)
 
-    if frame:
-        live_frame = frame
-        live_ts = datetime.now()
+    if decoded:
+        live_frame = decoded
 
-    return {
-        "ok": True
+    now = datetime.now()
+
+    live_ts = now
+
+    live_info = {
+        "fps": report.fps,
+        "status": report.status,
+        "last_update": now.isoformat(),
     }
 
+    return {
+        "success": True
+    }
+
+
+# =========================================================
+# API - DASHBOARD
+# =========================================================
 
 @app.get("/api/dashboard")
-def dashboard_api():
-    response = {
-        "latest": latest_round,
-        "history": list(round_history),
-        "shrimp_types": SHRIMP_TYPES
+async def dashboard_data():
+    return {
+        "latest_round": latest_round,
+        "history": list(round_history)[-20:],
+        "total_rounds": len(round_history),
     }
 
-    return response
 
+# =========================================================
+# API - LIVE STATUS
+# =========================================================
 
 @app.get("/api/live/status")
-def live_status():
-    return {
-        "online": live_frame is not None,
-        "last_update": live_ts.isoformat() if live_ts else None
-    }
+async def live_status():
 
+    status = live_info.copy()
+
+    if live_ts:
+        elapsed = (
+            datetime.now() - live_ts
+        ).total_seconds()
+
+        if elapsed > 5:
+            status["status"] = "offline"
+
+    return status
+
+
+# =========================================================
+# API - LIVE FRAME
+# =========================================================
 
 @app.get("/api/live/frame")
-def get_live_frame():
+async def live_frame_api():
 
     if not live_frame:
         raise HTTPException(
             status_code=404,
-            detail="No live frame"
+            detail="No camera frame"
         )
 
-    response = Response(
+    return Response(
         content=live_frame,
-        media_type="image/jpeg"
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store"
+        }
     )
 
-    return no_cache(response)
+
+# =========================================================
+# ANALYTICS
+# =========================================================
+
+def aggregate_daily():
+
+    buckets = {}
+
+    for item in round_history:
+
+        dt = get_round_datetime(item)
+
+        key = dt.strftime("%Y-%m-%d")
+
+        if key not in buckets:
+            buckets[key] = {
+                "period": key,
+                "label": dt.strftime("%d/%m"),
+                "counts": {
+                    x: 0 for x in SHRIMP_TYPES
+                },
+                "total": 0,
+                "rounds": 0,
+            }
+
+        counts = clean_counts(item.get("counts", {}))
+
+        for shrimp_type in SHRIMP_TYPES:
+            buckets[key]["counts"][shrimp_type] += counts[shrimp_type]
+
+        buckets[key]["total"] += total_count(counts)
+        buckets[key]["rounds"] += 1
+
+    return sorted(
+        buckets.values(),
+        key=lambda x: x["period"]
+    )
+
+
+def aggregate_monthly():
+
+    buckets = {}
+
+    for item in round_history:
+
+        dt = get_round_datetime(item)
+
+        key = dt.strftime("%Y-%m")
+
+        if key not in buckets:
+            buckets[key] = {
+                "period": key,
+                "label": dt.strftime("%m/%Y"),
+                "counts": {
+                    x: 0 for x in SHRIMP_TYPES
+                },
+                "total": 0,
+                "rounds": 0,
+            }
+
+        counts = clean_counts(item.get("counts", {}))
+
+        for shrimp_type in SHRIMP_TYPES:
+            buckets[key]["counts"][shrimp_type] += counts[shrimp_type]
+
+        buckets[key]["total"] += total_count(counts)
+        buckets[key]["rounds"] += 1
+
+    return sorted(
+        buckets.values(),
+        key=lambda x: x["period"]
+    )
+
+
+def aggregate_yearly():
+
+    buckets = {}
+
+    for item in round_history:
+
+        dt = get_round_datetime(item)
+
+        key = dt.strftime("%Y")
+
+        if key not in buckets:
+            buckets[key] = {
+                "period": key,
+                "label": key,
+                "counts": {
+                    x: 0 for x in SHRIMP_TYPES
+                },
+                "total": 0,
+                "rounds": 0,
+            }
+
+        counts = clean_counts(item.get("counts", {}))
+
+        for shrimp_type in SHRIMP_TYPES:
+            buckets[key]["counts"][shrimp_type] += counts[shrimp_type]
+
+        buckets[key]["total"] += total_count(counts)
+        buckets[key]["rounds"] += 1
+
+    return sorted(
+        buckets.values(),
+        key=lambda x: x["period"]
+    )
 
 
 # =========================================================
-# PREMIUM UI
+# ANALYTICS API
 # =========================================================
 
-HTML = r"""
-<!DOCTYPE html>
-<html lang="th">
+@app.get("/api/analytics/daily")
+async def analytics_daily():
 
-<head>
+    data = aggregate_daily()
 
-<meta charset="UTF-8">
+    return {
+        "type": "daily",
+        "data": data[-30:],
+    }
 
-<meta
-    name="viewport"
-    content="width=device-width, initial-scale=1.0"
->
 
-<title>Shrimp Vision AI</title>
+@app.get("/api/analytics/monthly")
+async def analytics_monthly():
 
-<style>
+    data = aggregate_monthly()
 
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Noto+Sans+Thai:wght@400;500;600;700;800&display=swap');
+    return {
+        "type": "monthly",
+        "data": data[-12:],
+    }
 
-:root{
 
-    --bg:#f3f8fc;
-    --card:#ffffff;
-    --text:#10233d;
-    --muted:#718096;
+@app.get("/api/analytics/yearly")
+async def analytics_yearly():
 
-    --blue:#1687ff;
-    --cyan:#00c6ff;
-    --purple:#7957ff;
+    data = aggregate_yearly()
 
-    --green:#12b981;
-    --orange:#ff9d42;
-    --red:#ff5364;
+    return {
+        "type": "yearly",
+        "data": data[-10:],
+    }
 
-    --border:rgba(25,80,130,.09);
 
-    --shadow:
-        0 20px 60px rgba(26,72,110,.10);
+# =========================================================
+# COMMON CSS
+# =========================================================
 
+COMMON_CSS = """
+* {
+    box-sizing: border-box;
 }
 
-*{
-    box-sizing:border-box;
+html {
+    scroll-behavior: smooth;
 }
 
-html{
-    scroll-behavior:smooth;
-}
-
-body{
-
-    margin:0;
-
-    background:
-        radial-gradient(
-            circle at 10% 0%,
-            rgba(0,198,255,.12),
-            transparent 28%
-        ),
-        radial-gradient(
-            circle at 90% 10%,
-            rgba(121,87,255,.10),
-            transparent 28%
-        ),
-        var(--bg);
-
-    color:var(--text);
-
+body {
+    margin: 0;
     font-family:
-        "Noto Sans Thai",
         Inter,
+        "Noto Sans Thai",
+        Arial,
         sans-serif;
-
-    min-height:100vh;
-}
-
-a{
-    text-decoration:none;
-    color:inherit;
-}
-
-button{
-    font-family:inherit;
-}
-
-
-/* ======================================================
-   NAVBAR
-====================================================== */
-
-.navbar{
-
-    position:sticky;
-    top:0;
-    z-index:100;
-
-    height:76px;
-
-    display:flex;
-    align-items:center;
-    justify-content:space-between;
-
-    padding:0 42px;
-
-    background:rgba(255,255,255,.82);
-
-    backdrop-filter:blur(24px);
-
-    border-bottom:1px solid var(--border);
-}
-
-.brand{
-
-    display:flex;
-    align-items:center;
-    gap:13px;
-}
-
-.logo{
-
-    width:45px;
-    height:45px;
-
-    display:grid;
-    place-items:center;
-
-    border-radius:15px;
 
     background:
         linear-gradient(
             135deg,
-            #00c6ff,
-            #1687ff,
-            #7957ff
+            #f7f9fc 0%,
+            #eef3f8 100%
         );
 
-    color:white;
-
-    font-size:22px;
-
-    box-shadow:
-        0 10px 25px rgba(22,135,255,.25);
+    color: #16202a;
 }
 
-.brand-text h1{
-
-    margin:0;
-
-    font-size:18px;
-    font-weight:800;
-
-    letter-spacing:-.4px;
+a {
+    color: inherit;
+    text-decoration: none;
 }
 
-.brand-text span{
+.navbar {
+    height: 76px;
 
-    color:var(--muted);
+    background: rgba(255,255,255,.90);
 
-    font-size:11px;
+    backdrop-filter: blur(18px);
 
-    font-weight:600;
+    border-bottom: 1px solid #e5eaf0;
+
+    display: flex;
+    align-items: center;
+
+    padding: 0 5%;
+
+    position: sticky;
+    top: 0;
+    z-index: 100;
 }
 
-.nav-right{
+.logo {
+    font-size: 21px;
+    font-weight: 800;
 
-    display:flex;
-    align-items:center;
-    gap:12px;
+    display: flex;
+    align-items: center;
+
+    gap: 10px;
+
+    white-space: nowrap;
 }
 
-.status{
+.logo-icon {
+    width: 38px;
+    height: 38px;
 
-    display:flex;
-    align-items:center;
-    gap:8px;
-
-    padding:9px 14px;
-
-    background:#ecfbf5;
-
-    color:#0b9b6c;
-
-    border-radius:999px;
-
-    font-size:12px;
-    font-weight:700;
-}
-
-.status-dot{
-
-    width:8px;
-    height:8px;
-
-    border-radius:50%;
-
-    background:#16c58c;
-
-    box-shadow:
-        0 0 0 5px rgba(22,197,140,.12);
-}
-
-.nav-btn{
-
-    padding:10px 17px;
-
-    border-radius:12px;
-
-    background:#f1f6fb;
-
-    color:#29435f;
-
-    font-size:13px;
-
-    font-weight:700;
-
-    transition:.2s;
-}
-
-.nav-btn:hover{
-
-    background:#e5f2ff;
-    color:var(--blue);
-
-}
-
-
-/* ======================================================
-   PAGE
-====================================================== */
-
-.container{
-
-    width:min(1440px, calc(100% - 48px));
-
-    margin:auto;
-
-    padding:38px 0 70px;
-}
-
-
-/* ======================================================
-   HERO
-====================================================== */
-
-.hero{
-
-    position:relative;
-
-    overflow:hidden;
-
-    padding:40px;
-
-    min-height:240px;
-
-    border-radius:30px;
+    border-radius: 12px;
 
     background:
+        linear-gradient(
+            135deg,
+            #111827,
+            #34495e
+        );
 
+    color: white;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    font-size: 19px;
+}
+
+.nav {
+    margin-left: auto;
+
+    display: flex;
+    align-items: center;
+
+    gap: 7px;
+
+    overflow-x: auto;
+}
+
+.nav a {
+    padding: 10px 15px;
+
+    border-radius: 12px;
+
+    color: #65717e;
+
+    font-size: 14px;
+
+    font-weight: 600;
+
+    white-space: nowrap;
+
+    transition: .2s;
+}
+
+.nav a:hover,
+.nav a.active {
+    background: #edf2f6;
+    color: #111827;
+}
+
+.container {
+    width: min(1400px, 90%);
+
+    margin: 0 auto;
+}
+
+.page {
+    padding: 42px 0 70px;
+}
+
+.page-title {
+    margin-bottom: 28px;
+}
+
+.page-title .eyebrow {
+    color: #7b8794;
+
+    font-size: 12px;
+
+    font-weight: 800;
+
+    text-transform: uppercase;
+
+    letter-spacing: 1.8px;
+
+    margin-bottom: 8px;
+}
+
+.page-title h1 {
+    margin: 0;
+
+    font-size: clamp(30px, 4vw, 48px);
+
+    letter-spacing: -1.5px;
+}
+
+.page-title p {
+    margin-top: 10px;
+
+    color: #73808d;
+
+    font-size: 15px;
+}
+
+.hero {
+    padding: 55px 0 35px;
+}
+
+.hero-grid {
+    display: grid;
+
+    grid-template-columns:
+        1.35fr
+        .65fr;
+
+    gap: 25px;
+
+    align-items: stretch;
+}
+
+.hero-main {
+    background:
+        linear-gradient(
+            135deg,
+            #ffffff,
+            #f1f5f8
+        );
+
+    border: 1px solid #e1e7ed;
+
+    border-radius: 28px;
+
+    padding: 45px;
+
+    box-shadow:
+        0 20px 50px rgba(31,41,55,.07);
+}
+
+.hero-main h1 {
+    margin: 0;
+
+    font-size: clamp(34px, 5vw, 64px);
+
+    line-height: 1.02;
+
+    letter-spacing: -2.5px;
+}
+
+.hero-main h1 span {
+    color: #687785;
+}
+
+.hero-main p {
+    color: #687785;
+
+    max-width: 680px;
+
+    line-height: 1.8;
+
+    margin-top: 20px;
+}
+
+.hero-side {
+    background: #111827;
+
+    color: white;
+
+    border-radius: 28px;
+
+    padding: 35px;
+
+    display: flex;
+
+    flex-direction: column;
+
+    justify-content: space-between;
+
+    box-shadow:
+        0 20px 50px rgba(17,24,39,.18);
+}
+
+.hero-side .number {
+    font-size: 58px;
+
+    font-weight: 800;
+
+    letter-spacing: -3px;
+}
+
+.hero-side .label {
+    color: #aeb8c3;
+
+    font-size: 14px;
+}
+
+.btn {
+    display: inline-flex;
+
+    align-items: center;
+
+    justify-content: center;
+
+    gap: 8px;
+
+    padding: 12px 18px;
+
+    border-radius: 12px;
+
+    font-weight: 700;
+
+    font-size: 14px;
+
+    transition: .2s;
+}
+
+.btn-dark {
+    background: #111827;
+    color: white;
+}
+
+.btn-light {
+    background: white;
+
+    border: 1px solid #dfe5eb;
+}
+
+.btn:hover {
+    transform: translateY(-2px);
+}
+
+.kpi-grid {
+    display: grid;
+
+    grid-template-columns:
+        repeat(4, 1fr);
+
+    gap: 16px;
+
+    margin: 28px 0;
+}
+
+.kpi {
+    background: rgba(255,255,255,.85);
+
+    border: 1px solid #e3e8ed;
+
+    border-radius: 20px;
+
+    padding: 23px;
+
+    box-shadow:
+        0 10px 30px rgba(31,41,55,.045);
+}
+
+.kpi-label {
+    color: #7d8995;
+
+    font-size: 13px;
+
+    font-weight: 600;
+}
+
+.kpi-value {
+    margin-top: 8px;
+
+    font-size: 31px;
+
+    font-weight: 800;
+
+    letter-spacing: -1px;
+}
+
+.shrimp-grid {
+    display: grid;
+
+    grid-template-columns:
+        repeat(4, 1fr);
+
+    gap: 16px;
+
+    margin-top: 18px;
+}
+
+.shrimp-card {
+    background: white;
+
+    border: 1px solid #e3e8ed;
+
+    border-radius: 20px;
+
+    padding: 22px;
+
+    box-shadow:
+        0 10px 30px rgba(31,41,55,.04);
+}
+
+.shrimp-card .icon {
+    font-size: 28px;
+
+    margin-bottom: 13px;
+}
+
+.shrimp-card .name {
+    color: #75818d;
+
+    font-size: 13px;
+}
+
+.shrimp-card .value {
+    font-size: 30px;
+
+    font-weight: 800;
+
+    margin-top: 5px;
+}
+
+.section {
+    margin-top: 32px;
+}
+
+.section-head {
+    display: flex;
+
+    justify-content: space-between;
+
+    align-items: center;
+
+    margin-bottom: 15px;
+}
+
+.section-head h2 {
+    margin: 0;
+
+    font-size: 20px;
+}
+
+.panel {
+    background: white;
+
+    border: 1px solid #e2e7ec;
+
+    border-radius: 24px;
+
+    padding: 25px;
+
+    box-shadow:
+        0 10px 35px rgba(31,41,55,.045);
+}
+
+.table-wrap {
+    overflow-x: auto;
+}
+
+table {
+    width: 100%;
+
+    border-collapse: collapse;
+
+    font-size: 14px;
+}
+
+th {
+    text-align: left;
+
+    color: #7d8995;
+
+    font-size: 12px;
+
+    font-weight: 700;
+
+    padding: 13px;
+
+    border-bottom: 1px solid #edf0f3;
+}
+
+td {
+    padding: 15px 13px;
+
+    border-bottom: 1px solid #f0f2f5;
+}
+
+.badge {
+    display: inline-flex;
+
+    padding: 6px 10px;
+
+    border-radius: 999px;
+
+    background: #f0f3f6;
+
+    color: #4e5c69;
+
+    font-size: 12px;
+
+    font-weight: 700;
+}
+
+.chart-panel {
+    min-height: 500px;
+
+    position: relative;
+}
+
+.chart-box {
+    width: 100%;
+
+    height: 430px;
+
+    position: relative;
+}
+
+canvas {
+    width: 100% !important;
+
+    height: 100% !important;
+}
+
+.chart-legend {
+    display: flex;
+
+    gap: 18px;
+
+    flex-wrap: wrap;
+
+    margin-top: 18px;
+
+    color: #697582;
+
+    font-size: 13px;
+}
+
+.legend-item {
+    display: flex;
+
+    align-items: center;
+
+    gap: 7px;
+}
+
+.dot {
+    width: 10px;
+    height: 10px;
+
+    border-radius: 50%;
+
+    background: #111827;
+}
+
+.dot.a { background: #8b9aaa; }
+.dot.b { background: #4e6477; }
+.dot.c { background: #1f3445; }
+.dot.d { background: #d27b72; }
+
+.empty {
+    min-height: 350px;
+
+    display: flex;
+
+    align-items: center;
+
+    justify-content: center;
+
+    text-align: center;
+
+    color: #8a96a1;
+}
+
+.camera-panel {
+    background: #101820;
+
+    border-radius: 28px;
+
+    overflow: hidden;
+
+    box-shadow:
+        0 25px 70px rgba(16,24,32,.18);
+}
+
+.camera-screen {
+    width: 100%;
+
+    aspect-ratio: 16 / 9;
+
+    background:
         radial-gradient(
-            circle at 85% 25%,
-            rgba(255,255,255,.35),
-            transparent 24%
-        ),
-
-        linear-gradient(
-            120deg,
-            #0b74e5 0%,
-            #1687ff 40%,
-            #00bde9 100%
+            circle at center,
+            #27333d,
+            #0b1117
         );
 
-    color:white;
+    display: flex;
 
-    box-shadow:
-        0 25px 70px rgba(13,117,225,.25);
+    align-items: center;
+
+    justify-content: center;
+
+    position: relative;
 }
 
-.hero:before{
+.camera-screen img {
+    width: 100%;
+    height: 100%;
 
-    content:"";
-
-    position:absolute;
-
-    width:340px;
-    height:340px;
-
-    right:-90px;
-    top:-170px;
-
-    border-radius:50%;
-
-    border:55px solid rgba(255,255,255,.08);
+    object-fit: contain;
 }
 
-.hero:after{
+.camera-empty {
+    color: #87939d;
 
-    content:"";
-
-    position:absolute;
-
-    width:180px;
-    height:180px;
-
-    right:230px;
-    bottom:-110px;
-
-    border-radius:50%;
-
-    background:rgba(255,255,255,.08);
+    text-align: center;
 }
 
-.hero-content{
+.camera-status {
+    padding: 17px 22px;
 
-    position:relative;
-    z-index:2;
+    display: flex;
 
-    max-width:720px;
+    justify-content: space-between;
+
+    align-items: center;
+
+    color: white;
 }
 
-.hero-kicker{
+.status {
+    display: inline-flex;
 
-    display:inline-flex;
+    align-items: center;
 
-    padding:7px 12px;
+    gap: 8px;
 
-    border-radius:999px;
-
-    background:rgba(255,255,255,.16);
-
-    backdrop-filter:blur(10px);
-
-    font-size:11px;
-
-    font-weight:700;
-
-    margin-bottom:16px;
+    font-size: 13px;
 }
 
-.hero h2{
+.status-dot {
+    width: 9px;
+    height: 9px;
 
-    margin:0 0 10px;
+    border-radius: 50%;
 
-    font-size:clamp(30px,4vw,48px);
-
-    line-height:1.1;
-
-    letter-spacing:-1.7px;
+    background: #ef4444;
 }
 
-.hero p{
-
-    margin:0;
-
-    max-width:600px;
-
-    color:rgba(255,255,255,.85);
-
-    font-size:14px;
-
-    line-height:1.8;
+.status.online .status-dot {
+    background: #4ade80;
 }
 
-.hero-actions{
-
-    display:flex;
-
-    gap:10px;
-
-    margin-top:25px;
-}
-
-.hero-button{
-
-    padding:12px 19px;
-
-    border:0;
-
-    border-radius:13px;
-
-    background:white;
-
-    color:#0876e8;
-
-    font-weight:800;
-
-    cursor:pointer;
-
-    box-shadow:
-        0 8px 25px rgba(0,0,0,.12);
-}
-
-.hero-button.secondary{
-
-    background:rgba(255,255,255,.14);
-
-    color:white;
-
-    border:1px solid rgba(255,255,255,.18);
-
-}
-
-
-/* ======================================================
-   KPI
-====================================================== */
-
-.section-title{
-
-    display:flex;
-
-    justify-content:space-between;
-    align-items:end;
-
-    margin:34px 0 15px;
-}
-
-.section-title h3{
-
-    margin:0;
-
-    font-size:19px;
-}
-
-.section-title span{
-
-    color:var(--muted);
-
-    font-size:12px;
-}
-
-.kpi-grid{
-
-    display:grid;
+.live-stats {
+    display: grid;
 
     grid-template-columns:
-        repeat(4,1fr);
+        repeat(3, 1fr);
 
-    gap:16px;
+    gap: 15px;
+
+    margin-top: 20px;
 }
 
-.kpi{
+.live-stat {
+    background: white;
 
-    position:relative;
+    border: 1px solid #e3e8ed;
 
-    overflow:hidden;
+    border-radius: 18px;
 
-    padding:23px;
-
-    background:rgba(255,255,255,.9);
-
-    border:1px solid var(--border);
-
-    border-radius:22px;
-
-    box-shadow:var(--shadow);
-
-    transition:.25s;
+    padding: 20px;
 }
 
-.kpi:hover{
+.live-stat span {
+    color: #7c8894;
 
-    transform:translateY(-4px);
-
-    box-shadow:
-        0 28px 70px rgba(26,72,110,.15);
+    font-size: 12px;
 }
 
-.kpi-top{
+.live-stat strong {
+    display: block;
 
-    display:flex;
+    margin-top: 5px;
 
-    justify-content:space-between;
-    align-items:center;
+    font-size: 25px;
 }
 
-.kpi-icon{
+.footer {
+    padding: 35px 0;
 
-    width:43px;
-    height:43px;
+    text-align: center;
 
-    display:grid;
-    place-items:center;
+    color: #8b96a1;
 
-    border-radius:14px;
-
-    font-size:20px;
+    font-size: 12px;
 }
 
-.kpi:nth-child(1) .kpi-icon{
-    background:#e8f3ff;
-}
-
-.kpi:nth-child(2) .kpi-icon{
-    background:#e9fbf4;
-}
-
-.kpi:nth-child(3) .kpi-icon{
-    background:#fff5e8;
-}
-
-.kpi:nth-child(4) .kpi-icon{
-    background:#fff0f2;
-}
-
-.kpi-label{
-
-    margin-top:18px;
-
-    color:var(--muted);
-
-    font-size:12px;
-
-    font-weight:600;
-}
-
-.kpi-value{
-
-    margin-top:3px;
-
-    font-size:31px;
-
-    font-weight:800;
-
-    letter-spacing:-1px;
-}
-
-.kpi-small{
-
-    margin-top:4px;
-
-    color:var(--muted);
-
-    font-size:10px;
-}
-
-
-/* ======================================================
-   SHRIMP CARDS
-====================================================== */
-
-.shrimp-grid{
-
-    display:grid;
-
-    grid-template-columns:
-        repeat(4,1fr);
-
-    gap:16px;
-}
-
-.shrimp{
-
-    position:relative;
-
-    overflow:hidden;
-
-    padding:22px;
-
-    min-height:165px;
-
-    background:white;
-
-    border-radius:23px;
-
-    border:1px solid var(--border);
-
-    box-shadow:var(--shadow);
-
-    transition:.25s;
-}
-
-.shrimp:hover{
-
-    transform:translateY(-5px);
-
-}
-
-.shrimp:after{
-
-    content:"";
-
-    position:absolute;
-
-    width:110px;
-    height:110px;
-
-    border-radius:50%;
-
-    right:-45px;
-    bottom:-50px;
-
-    background:var(--accent);
-
-    opacity:.08;
-}
-
-.shrimp-icon{
-
-    width:48px;
-    height:48px;
-
-    display:grid;
-    place-items:center;
-
-    border-radius:16px;
-
-    background:var(--soft);
-
-    font-size:24px;
-
-    margin-bottom:16px;
-}
-
-.shrimp-name{
-
-    color:var(--muted);
-
-    font-size:12px;
-
-    font-weight:700;
-}
-
-.shrimp-count{
-
-    margin-top:2px;
-
-    font-size:30px;
-
-    font-weight:800;
-}
-
-.shrimp-unit{
-
-    font-size:11px;
-    color:var(--muted);
-}
-
-.shrimp-bar{
-
-    height:5px;
-
-    margin-top:13px;
-
-    background:#edf3f7;
-
-    border-radius:99px;
-
-    overflow:hidden;
-}
-
-.shrimp-bar span{
-
-    display:block;
-
-    height:100%;
-
-    width:0%;
-
-    background:var(--accent);
-
-    border-radius:99px;
-
-    transition:width .7s ease;
-}
-
-
-/* ======================================================
-   CONTENT GRID
-====================================================== */
-
-.content-grid{
-
-    display:grid;
-
-    grid-template-columns:
-        1.5fr 1fr;
-
-    gap:18px;
-
-    margin-top:18px;
-}
-
-.panel{
-
-    background:rgba(255,255,255,.94);
-
-    border:1px solid var(--border);
-
-    border-radius:25px;
-
-    padding:25px;
-
-    box-shadow:var(--shadow);
-}
-
-.panel-head{
-
-    display:flex;
-
-    justify-content:space-between;
-    align-items:center;
-
-    margin-bottom:20px;
-}
-
-.panel-head h3{
-
-    margin:0;
-
-    font-size:16px;
-}
-
-.panel-head span{
-
-    color:var(--muted);
-
-    font-size:11px;
-}
-
-
-/* ======================================================
-   CHART
-====================================================== */
-
-.chart-wrap{
-
-    height:280px;
-
-    display:flex;
-
-    align-items:center;
-    justify-content:center;
-
-    position:relative;
-}
-
-canvas{
-
-    max-width:100%;
-}
-
-
-/* ======================================================
-   ROUND SUMMARY
-====================================================== */
-
-.round-id{
-
-    padding:7px 11px;
-
-    border-radius:10px;
-
-    background:#edf7ff;
-
-    color:#0876e8;
-
-    font-size:11px;
-
-    font-weight:800;
-}
-
-.summary-number{
-
-    font-size:52px;
-
-    font-weight:800;
-
-    letter-spacing:-3px;
-
-    line-height:1;
-
-    margin:12px 0 5px;
-}
-
-.summary-label{
-
-    color:var(--muted);
-
-    font-size:12px;
-}
-
-.progress{
-
-    height:9px;
-
-    margin:25px 0 10px;
-
-    background:#edf2f6;
-
-    border-radius:99px;
-
-    overflow:hidden;
-}
-
-.progress span{
-
-    display:block;
-
-    height:100%;
-
-    width:0%;
-
-    background:
-        linear-gradient(
-            90deg,
-            #00c6ff,
-            #1687ff,
-            #7957ff
-        );
-
-    border-radius:99px;
-
-    transition:width .8s ease;
-}
-
-.summary-grid{
-
-    display:grid;
-
-    grid-template-columns:1fr 1fr;
-
-    gap:10px;
-
-    margin-top:20px;
-}
-
-.mini{
-
-    padding:13px;
-
-    border-radius:14px;
-
-    background:#f7fafc;
-}
-
-.mini label{
-
-    display:block;
-
-    color:var(--muted);
-
-    font-size:10px;
-}
-
-.mini strong{
-
-    display:block;
-
-    margin-top:4px;
-
-    font-size:16px;
-}
-
-
-/* ======================================================
-   HISTORY
-====================================================== */
-
-.history-panel{
-
-    margin-top:18px;
-}
-
-.table-wrap{
-
-    overflow-x:auto;
-}
-
-table{
-
-    width:100%;
-
-    border-collapse:collapse;
-
-    font-size:12px;
-}
-
-th{
-
-    text-align:left;
-
-    color:#8492a3;
-
-    font-size:10px;
-
-    font-weight:700;
-
-    padding:13px;
-
-    border-bottom:1px solid #edf2f6;
-
-}
-
-td{
-
-    padding:15px 13px;
-
-    border-bottom:1px solid #f0f4f7;
-
-    white-space:nowrap;
-}
-
-tr:last-child td{
-    border-bottom:0;
-}
-
-.round-pill{
-
-    display:inline-flex;
-
-    padding:6px 9px;
-
-    background:#edf7ff;
-
-    color:#1687ff;
-
-    border-radius:8px;
-
-    font-weight:800;
-}
-
-.sick-pill{
-
-    display:inline-flex;
-
-    padding:5px 8px;
-
-    background:#fff0f2;
-
-    color:#e7485b;
-
-    border-radius:7px;
-
-    font-weight:700;
-}
-
-.empty{
-
-    padding:55px 20px;
-
-    text-align:center;
-
-    color:var(--muted);
-}
-
-.empty-icon{
-
-    font-size:40px;
-
-    margin-bottom:10px;
-}
-
-
-/* ======================================================
-   LIVE PAGE
-====================================================== */
-
-.live-layout{
-
-    display:grid;
-
-    grid-template-columns:
-        1.65fr .7fr;
-
-    gap:18px;
-}
-
-.camera{
-
-    position:relative;
-
-    overflow:hidden;
-
-    min-height:600px;
-
-    border-radius:28px;
-
-    background:#091827;
-
-    box-shadow:
-        0 25px 70px rgba(7,28,49,.22);
-}
-
-.camera img{
-
-    width:100%;
-    height:100%;
-
-    min-height:600px;
-
-    object-fit:cover;
-
-    display:block;
-}
-
-.camera-overlay{
-
-    position:absolute;
-
-    left:18px;
-    right:18px;
-    top:18px;
-
-    display:flex;
-
-    justify-content:space-between;
-
-    align-items:center;
-}
-
-.camera-status{
-
-    display:flex;
-    align-items:center;
-    gap:8px;
-
-    padding:9px 13px;
-
-    border-radius:12px;
-
-    color:white;
-
-    background:rgba(5,22,39,.65);
-
-    backdrop-filter:blur(12px);
-
-    font-size:11px;
-
-    font-weight:700;
-}
-
-.live-dot{
-
-    width:8px;
-    height:8px;
-
-    border-radius:50%;
-
-    background:#16d391;
-
-    animation:pulse 1.5s infinite;
-}
-
-@keyframes pulse{
-
-    0%,100%{
-        box-shadow:0 0 0 0 rgba(22,211,145,.4);
+@media(max-width: 1000px) {
+    .hero-grid {
+        grid-template-columns: 1fr;
     }
-
-    50%{
-        box-shadow:0 0 0 9px rgba(22,211,145,0);
-    }
-}
-
-.no-camera{
-
-    position:absolute;
-
-    inset:0;
-
-    display:grid;
-
-    place-items:center;
-
-    color:#8ba2b8;
-
-    text-align:center;
-}
-
-.no-camera div{
-
-    padding:30px;
-}
-
-.no-camera-icon{
-
-    font-size:55px;
-
-    margin-bottom:10px;
-}
-
-.live-side{
-
-    display:flex;
-
-    flex-direction:column;
-
-    gap:16px;
-}
-
-
-/* ======================================================
-   FOOTER
-====================================================== */
-
-.footer{
-
-    text-align:center;
-
-    color:#8a99aa;
-
-    font-size:10px;
-
-    padding-top:35px;
-}
-
-
-/* ======================================================
-   RESPONSIVE
-====================================================== */
-
-@media(max-width:1100px){
 
     .kpi-grid,
-    .shrimp-grid{
-
+    .shrimp-grid {
         grid-template-columns:
-            repeat(2,1fr);
+            repeat(2, 1fr);
     }
-
-    .content-grid,
-    .live-layout{
-
-        grid-template-columns:1fr;
-    }
-
 }
 
-@media(max-width:700px){
+@media(max-width: 650px) {
+    .navbar {
+        height: auto;
 
-    .navbar{
+        padding: 12px 5%;
 
-        padding:0 17px;
+        flex-direction: column;
+
+        align-items: stretch;
+
+        gap: 10px;
     }
 
-    .nav-right .status{
-        display:none;
+    .nav {
+        margin-left: 0;
     }
 
-    .container{
-
-        width:min(
-            100% - 24px,
-            1440px
-        );
-
-        padding-top:18px;
-    }
-
-    .hero{
-
-        padding:28px;
-
-        border-radius:23px;
-    }
-
-    .hero h2{
-
-        font-size:31px;
-    }
-
-    .hero-actions{
-
-        flex-direction:column;
-    }
-
-    .hero-button{
-
-        width:100%;
+    .hero-main {
+        padding: 30px;
     }
 
     .kpi-grid,
-    .shrimp-grid{
-
-        grid-template-columns:1fr;
+    .shrimp-grid,
+    .live-stats {
+        grid-template-columns: 1fr;
     }
 
-    .panel{
-
-        padding:18px;
+    .page {
+        padding-top: 28px;
     }
 
-    .camera,
-    .camera img{
-
-        min-height:420px;
+    .chart-box {
+        height: 320px;
     }
-
 }
-
-</style>
-
-</head>
+"""
 
 
-<body>
+# =========================================================
+# NAVBAR
+# =========================================================
 
+def navbar(active="dashboard"):
 
-<!-- =====================================================
-     NAVBAR
-====================================================== -->
+    return f"""
+    <nav class="navbar">
 
-<nav class="navbar">
-
-    <a class="brand" href="/">
-
-        <div class="logo">
-            🦐
-        </div>
-
-        <div class="brand-text">
-
-            <h1>Shrimp Vision AI</h1>
-
-            <span>
-                Intelligent Shrimp Sorting System
-            </span>
-
-        </div>
-
-    </a>
-
-
-    <div class="nav-right">
-
-        <div class="status">
-
-            <span class="status-dot"></span>
-
-            AI SYSTEM ONLINE
-
-        </div>
-
-        <a class="nav-btn" href="/">
-            Dashboard
+        <a href="/" class="logo">
+            <div class="logo-icon">🦐</div>
+            Shrimp Vision AI
         </a>
 
-        <a class="nav-btn" href="/live">
-            Live Camera
-        </a>
+        <div class="nav">
 
-    </div>
-
-</nav>
-
-
-
-<main class="container">
-
-
-<!-- =====================================================
-     HERO
-====================================================== -->
-
-<section class="hero">
-
-    <div class="hero-content">
-
-        <div class="hero-kicker">
-            ✦ AI-POWERED QUALITY CONTROL
-        </div>
-
-        <h2>
-            ระบบคัดแยกกุ้ง<br>
-            อัจฉริยะสำหรับโรงงาน
-        </h2>
-
-        <p>
-            วิเคราะห์และสรุปผลการคัดแยกกุ้งด้วย AI
-            แบบเป็นรอบ พร้อมติดตามจำนวนกุ้ง
-            คุณภาพ และกุ้งป่วยจากศูนย์กลางเดียว
-        </p>
-
-        <div class="hero-actions">
-
-            <a
-                class="hero-button"
-                href="/live"
-            >
-                ▶ เปิดกล้อง Real-time
+            <a href="/"
+               class="{ 'active' if active == 'dashboard' else '' }">
+                🏠 Dashboard
             </a>
 
-            <button
-                class="hero-button secondary"
-                onclick="loadData()"
-            >
-                ↻ รีเฟรชข้อมูล
-            </button>
+            <a href="/daily"
+               class="{ 'active' if active == 'daily' else '' }">
+                📅 รายวัน
+            </a>
+
+            <a href="/monthly"
+               class="{ 'active' if active == 'monthly' else '' }">
+                📆 รายเดือน
+            </a>
+
+            <a href="/yearly"
+               class="{ 'active' if active == 'yearly' else '' }">
+                📊 รายปี
+            </a>
+
+            <a href="/live"
+               class="{ 'active' if active == 'live' else '' }">
+                📷 กล้อง Live
+            </a>
 
         </div>
 
-    </div>
-
-</section>
-
+    </nav>
+    """
 
 
-<!-- =====================================================
-     KPI
-====================================================== -->
+# =========================================================
+# HTML WRAPPER
+# =========================================================
 
-<div class="section-title">
+def html_page(title, body, active="dashboard", script=""):
 
-    <h3>
-        ภาพรวมการทำงาน
-    </h3>
+    return f"""
+    <!DOCTYPE html>
 
-    <span id="lastUpdate">
-        กำลังโหลด...
-    </span>
+    <html lang="th">
 
-</div>
+    <head>
 
+        <meta charset="UTF-8">
 
-<section class="kpi-grid">
-
-
-    <div class="kpi">
-
-        <div class="kpi-top">
-
-            <div class="kpi-icon">
-                🧠
-            </div>
-
-        </div>
-
-        <div class="kpi-label">
-            รอบล่าสุด
-        </div>
-
-        <div
-            class="kpi-value"
-            id="kpiRound"
+        <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1.0"
         >
-            —
-        </div>
 
-        <div class="kpi-small">
-            AI Processing Round
-        </div>
+        <title>{title} | Shrimp Vision AI</title>
 
-    </div>
+        <style>
+            {COMMON_CSS}
+        </style>
 
+    </head>
 
+    <body>
 
-    <div class="kpi">
+        {navbar(active)}
 
-        <div class="kpi-top">
+        {body}
 
-            <div class="kpi-icon">
-                🦐
-            </div>
+        <footer class="footer">
+            Shrimp Vision AI • Intelligent Shrimp Sorting System
+        </footer>
 
-        </div>
+        {script}
 
-        <div class="kpi-label">
-            กุ้งทั้งหมด
-        </div>
+    </body>
 
-        <div
-            class="kpi-value"
-            id="kpiTotal"
-        >
-            0
-        </div>
+    </html>
+    """
 
-        <div class="kpi-small">
-            Total Detected
-        </div>
 
-    </div>
+# =========================================================
+# DASHBOARD PAGE
+# =========================================================
 
+@app.get("/", response_class=HTMLResponse)
+async def dashboard_page():
 
+    body = """
 
-    <div class="kpi">
+    <main class="container">
 
-        <div class="kpi-top">
+        <section class="hero">
 
-            <div class="kpi-icon">
-                ✓
-            </div>
+            <div class="hero-grid">
 
-        </div>
+                <div class="hero-main">
 
-        <div class="kpi-label">
-            กุ้งปกติ
-        </div>
+                    <div
+                        style="
+                        color:#7d8995;
+                        font-size:12px;
+                        font-weight:800;
+                        letter-spacing:2px;
+                        margin-bottom:15px;
+                        "
+                    >
+                        INTELLIGENT SHRIMP SORTING
+                    </div>
 
-        <div
-            class="kpi-value"
-            id="kpiNormal"
-        >
-            0
-        </div>
+                    <h1>
+                        Shrimp
+                        <span>Vision AI</span>
+                    </h1>
 
-        <div class="kpi-small">
-            Normal Shrimp
-        </div>
+                    <p>
+                        ระบบวิเคราะห์และคัดแยกกุ้งด้วย AI
+                        พร้อมสรุปข้อมูลการตรวจสอบ
+                        และติดตามประสิทธิภาพของกระบวนการผลิต
+                    </p>
 
-    </div>
+                    <div
+                        style="
+                        margin-top:25px;
+                        display:flex;
+                        gap:10px;
+                        flex-wrap:wrap;
+                        "
+                    >
 
+                        <a href="/daily"
+                           class="btn btn-dark">
+                            ดูสถิติ
+                        </a>
 
+                        <a href="/live"
+                           class="btn btn-light">
+                            เปิดกล้อง Live
+                        </a>
 
-    <div class="kpi">
+                    </div>
 
-        <div class="kpi-top">
+                </div>
 
-            <div class="kpi-icon">
-                ⚠
-            </div>
+                <div class="hero-side">
 
-        </div>
+                    <div>
 
-        <div class="kpi-label">
-            กุ้งป่วย
-        </div>
-
-        <div
-            class="kpi-value"
-            id="kpiSick"
-        >
-            0
-        </div>
-
-        <div class="kpi-small">
-            Quality Alert
-        </div>
-
-    </div>
-
-</section>
-
-
-
-<!-- =====================================================
-     SHRIMP TYPES
-====================================================== -->
-
-<div class="section-title">
-
-    <h3>
-        ผลการจำแนกประเภท
-    </h3>
-
-    <span>
-        AI Classification
-    </span>
-
-</div>
-
-
-<section class="shrimp-grid">
-
-
-    <div
-        class="shrimp"
-        style="--accent:#1687ff;--soft:#eaf4ff"
-    >
-
-        <div class="shrimp-icon">
-            🦐
-        </div>
-
-        <div class="shrimp-name">
-            กุ้งเล็ก
-        </div>
-
-        <div
-            class="shrimp-count"
-            id="smallCount"
-        >
-            0
-        </div>
-
-        <span class="shrimp-unit">
-            ตัว
-        </span>
-
-        <div class="shrimp-bar">
-            <span id="smallBar"></span>
-        </div>
-
-    </div>
-
-
-
-    <div
-        class="shrimp"
-        style="--accent:#7957ff;--soft:#f0edff"
-    >
-
-        <div class="shrimp-icon">
-            🦐
-        </div>
-
-        <div class="shrimp-name">
-            กุ้งกลาง
-        </div>
-
-        <div
-            class="shrimp-count"
-            id="mediumCount"
-        >
-            0
-        </div>
-
-        <span class="shrimp-unit">
-            ตัว
-        </span>
-
-        <div class="shrimp-bar">
-            <span id="mediumBar"></span>
-        </div>
-
-    </div>
-
-
-
-    <div
-        class="shrimp"
-        style="--accent:#ff9d42;--soft:#fff5e8"
-    >
-
-        <div class="shrimp-icon">
-            🦐
-        </div>
-
-        <div class="shrimp-name">
-            กุ้งใหญ่
-        </div>
-
-        <div
-            class="shrimp-count"
-            id="largeCount"
-        >
-            0
-        </div>
-
-        <span class="shrimp-unit">
-            ตัว
-        </span>
-
-        <div class="shrimp-bar">
-            <span id="largeBar"></span>
-        </div>
-
-    </div>
-
-
-
-    <div
-        class="shrimp"
-        style="--accent:#ff5364;--soft:#fff0f2"
-    >
-
-        <div class="shrimp-icon">
-            ⚠️
-        </div>
-
-        <div class="shrimp-name">
-            กุ้งป่วย
-        </div>
-
-        <div
-            class="shrimp-count"
-            id="sickCount"
-        >
-            0
-        </div>
-
-        <span class="shrimp-unit">
-            ตัว
-        </span>
-
-        <div class="shrimp-bar">
-            <span id="sickBar"></span>
-        </div>
-
-    </div>
-
-
-</section>
-
-
-
-<!-- =====================================================
-     CHART + SUMMARY
-====================================================== -->
-
-<section class="content-grid">
-
-
-    <div class="panel">
-
-        <div class="panel-head">
-
-            <h3>
-                สัดส่วนการคัดแยก
-            </h3>
-
-            <span>
-                Latest Round
-            </span>
-
-        </div>
-
-        <div class="chart-wrap">
-
-            <canvas
-                id="donut"
-                width="500"
-                height="280"
-            ></canvas>
-
-        </div>
-
-    </div>
-
-
-
-    <div class="panel">
-
-        <div class="panel-head">
-
-            <h3>
-                สรุปรอบล่าสุด
-            </h3>
-
-            <span
-                class="round-id"
-                id="roundBadge"
-            >
-                —
-            </span>
-
-        </div>
-
-
-        <div
-            class="summary-number"
-            id="summaryTotal"
-        >
-            0
-        </div>
-
-        <div class="summary-label">
-            กุ้งที่ตรวจพบทั้งหมด
-        </div>
-
-
-        <div class="progress">
-
-            <span id="qualityProgress"></span>
-
-        </div>
-
-
-        <div class="summary-grid">
-
-
-            <div class="mini">
-
-                <label>
-                    FPS เฉลี่ย
-                </label>
-
-                <strong id="fps">
-                    —
-                </strong>
-
-            </div>
-
-
-            <div class="mini">
-
-                <label>
-                    ระยะเวลารอบ
-                </label>
-
-                <strong id="duration">
-                    —
-                </strong>
-
-            </div>
-
-
-            <div class="mini">
-
-                <label>
-                    จำนวน Frame
-                </label>
-
-                <strong id="frames">
-                    —
-                </strong>
-
-            </div>
-
-
-            <div class="mini">
-
-                <label>
-                    อัตรากุ้งปกติ
-                </label>
-
-                <strong id="quality">
-                    —
-                </strong>
-
-            </div>
-
-
-        </div>
-
-    </div>
-
-
-</section>
-
-
-
-<!-- =====================================================
-     HISTORY
-====================================================== -->
-
-<section class="panel history-panel">
-
-    <div class="panel-head">
-
-        <h3>
-            ประวัติการทำงาน
-        </h3>
-
-        <span>
-            Latest 100 Rounds
-        </span>
-
-    </div>
-
-
-    <div class="table-wrap">
-
-        <table>
-
-            <thead>
-
-                <tr>
-
-                    <th>
-                        รอบ
-                    </th>
-
-                    <th>
-                        ทั้งหมด
-                    </th>
-
-                    <th>
-                        เล็ก
-                    </th>
-
-                    <th>
-                        กลาง
-                    </th>
-
-                    <th>
-                        ใหญ่
-                    </th>
-
-                    <th>
-                        ป่วย
-                    </th>
-
-                    <th>
-                        FPS
-                    </th>
-
-                    <th>
-                        เวลา
-                    </th>
-
-                </tr>
-
-            </thead>
-
-            <tbody id="history">
-
-            </tbody>
-
-        </table>
-
-    </div>
-
-</section>
-
-
-<div class="footer">
-
-    SHRIMP VISION AI · Intelligent Quality Control System
-
-</div>
-
-
-</main>
-
-
-
-<script>
-
-
-// ======================================================
-// UTIL
-// ======================================================
-
-function number(n){
-
-    return Number(n || 0).toLocaleString("th-TH");
-
-}
-
-
-function escapeHtml(text){
-
-    const div = document.createElement("div");
-
-    div.textContent = text ?? "";
-
-    return div.innerHTML;
-
-}
-
-
-// ======================================================
-// DONUT CHART
-// ======================================================
-
-function drawDonut(counts){
-
-    const canvas = document.getElementById("donut");
-
-    const ctx = canvas.getContext("2d");
-
-    const dpr = window.devicePixelRatio || 1;
-
-    const width = canvas.clientWidth || 500;
-
-    const height = 280;
-
-    canvas.width = width * dpr;
-
-    canvas.height = height * dpr;
-
-    ctx.scale(dpr,dpr);
-
-    ctx.clearRect(0,0,width,height);
-
-
-    const values = [
-
-        Number(counts["กุ้งเล็ก"] || 0),
-
-        Number(counts["กุ้งกลาง"] || 0),
-
-        Number(counts["กุ้งใหญ่"] || 0),
-
-        Number(counts["กุ้งป่วย"] || 0)
-
-    ];
-
-
-    const labels = [
-
-        "กุ้งเล็ก",
-        "กุ้งกลาง",
-        "กุ้งใหญ่",
-        "กุ้งป่วย"
-
-    ];
-
-
-    const colors = [
-
-        "#1687ff",
-        "#7957ff",
-        "#ff9d42",
-        "#ff5364"
-
-    ];
-
-
-    const total = values.reduce(
-        (a,b)=>a+b,
-        0
-    );
-
-
-    if(total === 0){
-
-        ctx.beginPath();
-
-        ctx.arc(
-            width/2 - 70,
-            height/2,
-            72,
-            0,
-            Math.PI*2
-        );
-
-        ctx.strokeStyle="#e9f0f5";
-
-        ctx.lineWidth=25;
-
-        ctx.stroke();
-
-        ctx.fillStyle="#718096";
-
-        ctx.font="600 13px Noto Sans Thai";
-
-        ctx.textAlign="center";
-
-        ctx.fillText(
-            "ยังไม่มีข้อมูล",
-            width/2 - 70,
-            height/2 + 5
-        );
-
-        return;
-    }
-
-
-    let angle = -Math.PI/2;
-
-    const cx = width/2 - 70;
-
-    const cy = height/2;
-
-    const radius = 72;
-
-
-    values.forEach((value,index)=>{
-
-        const slice =
-            (value / total) * Math.PI * 2;
-
-        ctx.beginPath();
-
-        ctx.arc(
-            cx,
-            cy,
-            radius,
-            angle,
-            angle + slice
-        );
-
-        ctx.strokeStyle =
-            colors[index];
-
-        ctx.lineWidth=25;
-
-        ctx.lineCap="round";
-
-        ctx.stroke();
-
-        angle += slice;
-
-    });
-
-
-    ctx.fillStyle="#10233d";
-
-    ctx.font="800 25px Inter";
-
-    ctx.textAlign="center";
-
-    ctx.fillText(
-        total.toLocaleString(),
-        cx,
-        cy + 7
-    );
-
-
-    ctx.fillStyle="#718096";
-
-    ctx.font="11px Noto Sans Thai";
-
-    ctx.fillText(
-        "ตัว",
-        cx,
-        cy + 27
-    );
-
-
-    labels.forEach((label,index)=>{
-
-        const y =
-            62 + index * 50;
-
-        ctx.beginPath();
-
-        ctx.arc(
-            width - 135,
-            y - 4,
-            5,
-            0,
-            Math.PI*2
-        );
-
-        ctx.fillStyle=colors[index];
-
-        ctx.fill();
-
-
-        ctx.textAlign="left";
-
-        ctx.fillStyle="#718096";
-
-        ctx.font="600 11px Noto Sans Thai";
-
-        ctx.fillText(
-            label,
-            width - 122,
-            y
-        );
-
-
-        ctx.fillStyle="#10233d";
-
-        ctx.font="800 13px Inter";
-
-        ctx.fillText(
-            values[index].toLocaleString(),
-            width - 122,
-            y + 19
-        );
-
-    });
-
-}
-
-
-// ======================================================
-// UPDATE UI
-// ======================================================
-
-function updateDashboard(data){
-
-    const latest = data.latest;
-
-    if(!latest){
-
-        document.getElementById("lastUpdate")
-            .textContent =
-            "ยังไม่มีรอบการประมวลผล";
-
-        return;
-
-    }
-
-
-    const counts =
-        latest.counts || {};
-
-
-    const total =
-        Number(latest.total || 0);
-
-    const normal =
-        Number(latest.normal_total || 0);
-
-    const sick =
-        Number(latest.sick_total || 0);
-
-
-    document.getElementById("kpiRound")
-        .textContent =
-        latest.round_id ?? "—";
-
-
-    document.getElementById("kpiTotal")
-        .textContent =
-        number(total);
-
-
-    document.getElementById("kpiNormal")
-        .textContent =
-        number(normal);
-
-
-    document.getElementById("kpiSick")
-        .textContent =
-        number(sick);
-
-
-    document.getElementById("summaryTotal")
-        .textContent =
-        number(total);
-
-
-    document.getElementById("roundBadge")
-        .textContent =
-        "ROUND " + (latest.round_id ?? "—");
-
-
-    document.getElementById("fps")
-        .textContent =
-        Number(latest.avg_fps || 0)
-        .toFixed(1);
-
-
-    document.getElementById("duration")
-        .textContent =
-        Number(latest.duration || 0)
-        .toFixed(1) + " s";
-
-
-    document.getElementById("frames")
-        .textContent =
-        number(latest.frames);
-
-
-    const quality =
-        total > 0
-            ? (normal / total) * 100
-            : 0;
-
-
-    document.getElementById("quality")
-        .textContent =
-        quality.toFixed(1) + "%";
-
-
-    document.getElementById("qualityProgress")
-        .style.width =
-        quality + "%";
-
-
-    const mapping = {
-
-        "กุ้งเล็ก":"small",
-        "กุ้งกลาง":"medium",
-        "กุ้งใหญ่":"large",
-        "กุ้งป่วย":"sick"
-
-    };
-
-
-    SHRIMP_TYPES.forEach(type=>{
-
-        const key = mapping[type];
-
-        const value =
-            Number(counts[type] || 0);
-
-
-        document.getElementById(
-            key + "Count"
-        ).textContent =
-            number(value);
-
-
-        const percent =
-            total > 0
-                ? (value / total) * 100
-                : 0;
-
-
-        document.getElementById(
-            key + "Bar"
-        ).style.width =
-            percent + "%";
-
-    });
-
-
-    drawDonut(counts);
-
-
-    document.getElementById("lastUpdate")
-        .textContent =
-        latest.finished_at
-            ? "จบรอบล่าสุด " + latest.finished_at
-            : "อัปเดตล่าสุด";
-
-}
-
-
-// ======================================================
-// HISTORY
-// ======================================================
-
-function renderHistory(history){
-
-    const tbody =
-        document.getElementById("history");
-
-
-    if(!history || history.length === 0){
-
-        tbody.innerHTML = `
-
-            <tr>
-
-                <td colspan="8">
-
-                    <div class="empty">
-
-                        <div class="empty-icon">
-                            🦐
+                        <div class="label">
+                            TOTAL SHRIMP
                         </div>
 
-                        <div>
-                            ยังไม่มีข้อมูลการประมวลผล
+                        <div
+                            class="number"
+                            id="heroTotal"
+                        >
+                            0
                         </div>
 
                     </div>
 
-                </td>
+                    <div class="label">
+                        จากรอบการตรวจล่าสุด
+                    </div>
 
-            </tr>
+                </div>
 
-        `;
+            </div>
 
-        return;
+        </section>
+
+
+        <section class="kpi-grid">
+
+            <div class="kpi">
+
+                <div class="kpi-label">
+                    รอบล่าสุด
+                </div>
+
+                <div
+                    class="kpi-value"
+                    id="roundId"
+                >
+                    -
+                </div>
+
+            </div>
+
+
+            <div class="kpi">
+
+                <div class="kpi-label">
+                    กุ้งทั้งหมด
+                </div>
+
+                <div
+                    class="kpi-value"
+                    id="total"
+                >
+                    0
+                </div>
+
+            </div>
+
+
+            <div class="kpi">
+
+                <div class="kpi-label">
+                    FPS เฉลี่ย
+                </div>
+
+                <div
+                    class="kpi-value"
+                    id="fps"
+                >
+                    0
+                </div>
+
+            </div>
+
+
+            <div class="kpi">
+
+                <div class="kpi-label">
+                    จำนวนรอบทั้งหมด
+                </div>
+
+                <div
+                    class="kpi-value"
+                    id="rounds"
+                >
+                    0
+                </div>
+
+            </div>
+
+        </section>
+
+
+        <section>
+
+            <div class="section-head">
+
+                <h2>
+                    ผลการคัดแยกล่าสุด
+                </h2>
+
+            </div>
+
+            <div class="shrimp-grid">
+
+                <div class="shrimp-card">
+
+                    <div class="icon">🦐</div>
+
+                    <div class="name">
+                        กุ้งเล็ก
+                    </div>
+
+                    <div
+                        class="value"
+                        id="small"
+                    >
+                        0
+                    </div>
+
+                </div>
+
+
+                <div class="shrimp-card">
+
+                    <div class="icon">🦐</div>
+
+                    <div class="name">
+                        กุ้งกลาง
+                    </div>
+
+                    <div
+                        class="value"
+                        id="medium"
+                    >
+                        0
+                    </div>
+
+                </div>
+
+
+                <div class="shrimp-card">
+
+                    <div class="icon">🦐</div>
+
+                    <div class="name">
+                        กุ้งใหญ่
+                    </div>
+
+                    <div
+                        class="value"
+                        id="large"
+                    >
+                        0
+                    </div>
+
+                </div>
+
+
+                <div class="shrimp-card">
+
+                    <div class="icon">⚠️</div>
+
+                    <div class="name">
+                        กุ้งป่วย
+                    </div>
+
+                    <div
+                        class="value"
+                        id="sick"
+                    >
+                        0
+                    </div>
+
+                </div>
+
+            </div>
+
+        </section>
+
+
+        <section class="section">
+
+            <div class="panel">
+
+                <div class="section-head">
+
+                    <h2>
+                        วิเคราะห์ข้อมูล
+                    </h2>
+
+                </div>
+
+                <div
+                    style="
+                    display:grid;
+                    grid-template-columns:
+                    repeat(auto-fit,minmax(220px,1fr));
+                    gap:14px;
+                    "
+                >
+
+                    <a href="/daily" class="kpi">
+                        <div class="kpi-label">
+                            DAILY
+                        </div>
+                        <div class="kpi-value">
+                            📅 รายวัน
+                        </div>
+                        <div
+                            style="
+                            color:#8a96a1;
+                            margin-top:7px;
+                            font-size:13px;
+                            "
+                        >
+                            ดูข้อมูลแยกตามวัน
+                        </div>
+                    </a>
+
+
+                    <a href="/monthly" class="kpi">
+                        <div class="kpi-label">
+                            MONTHLY
+                        </div>
+                        <div class="kpi-value">
+                            📆 รายเดือน
+                        </div>
+                        <div
+                            style="
+                            color:#8a96a1;
+                            margin-top:7px;
+                            font-size:13px;
+                            "
+                        >
+                            ดูข้อมูลแยกตามเดือน
+                        </div>
+                    </a>
+
+
+                    <a href="/yearly" class="kpi">
+                        <div class="kpi-label">
+                            YEARLY
+                        </div>
+                        <div class="kpi-value">
+                            📊 รายปี
+                        </div>
+                        <div
+                            style="
+                            color:#8a96a1;
+                            margin-top:7px;
+                            font-size:13px;
+                            "
+                        >
+                            ดูข้อมูลแยกตามปี
+                        </div>
+                    </a>
+
+                </div>
+
+            </div>
+
+        </section>
+
+
+        <section class="section">
+
+            <div class="section-head">
+
+                <h2>
+                    รอบล่าสุด
+                </h2>
+
+            </div>
+
+            <div class="panel">
+
+                <div class="table-wrap">
+
+                    <table>
+
+                        <thead>
+
+                            <tr>
+                                <th>รอบ</th>
+                                <th>กุ้งเล็ก</th>
+                                <th>กุ้งกลาง</th>
+                                <th>กุ้งใหญ่</th>
+                                <th>กุ้งป่วย</th>
+                                <th>รวม</th>
+                            </tr>
+
+                        </thead>
+
+                        <tbody id="history">
+                        </tbody>
+
+                    </table>
+
+                </div>
+
+            </div>
+
+        </section>
+
+    </main>
+    """
+
+    script = """
+
+    <script>
+
+    async function loadDashboard() {
+
+        try {
+
+            const response =
+                await fetch("/api/dashboard");
+
+            const data =
+                await response.json();
+
+            const latest =
+                data.latest_round;
+
+            document.getElementById("rounds")
+                .textContent =
+                data.total_rounds || 0;
+
+            if (!latest) {
+                return;
+            }
+
+            const c = latest.counts || {};
+
+            document.getElementById("roundId")
+                .textContent =
+                latest.round_id ?? "-";
+
+            document.getElementById("total")
+                .textContent =
+                latest.total ?? 0;
+
+            document.getElementById("heroTotal")
+                .textContent =
+                latest.total ?? 0;
+
+            document.getElementById("fps")
+                .textContent =
+                Number(latest.avg_fps || 0)
+                    .toFixed(1);
+
+            document.getElementById("small")
+                .textContent =
+                c["กุ้งเล็ก"] || 0;
+
+            document.getElementById("medium")
+                .textContent =
+                c["กุ้งกลาง"] || 0;
+
+            document.getElementById("large")
+                .textContent =
+                c["กุ้งใหญ่"] || 0;
+
+            document.getElementById("sick")
+                .textContent =
+                c["กุ้งป่วย"] || 0;
+
+
+            const history =
+                document.getElementById("history");
+
+            history.innerHTML = "";
+
+            const rows =
+                (data.history || [])
+                    .slice()
+                    .reverse();
+
+            rows.forEach(item => {
+
+                const c =
+                    item.counts || {};
+
+                history.innerHTML += `
+                    <tr>
+
+                        <td>
+                            <span class="badge">
+                                #${item.round_id}
+                            </span>
+                        </td>
+
+                        <td>${c["กุ้งเล็ก"] || 0}</td>
+
+                        <td>${c["กุ้งกลาง"] || 0}</td>
+
+                        <td>${c["กุ้งใหญ่"] || 0}</td>
+
+                        <td>${c["กุ้งป่วย"] || 0}</td>
+
+                        <td>
+                            <strong>
+                                ${item.total || 0}
+                            </strong>
+                        </td>
+
+                    </tr>
+                `;
+
+            });
+
+        } catch (error) {
+
+            console.error(error);
+
+        }
+
+    }
+
+    loadDashboard();
+
+    setInterval(loadDashboard, 3000);
+
+    </script>
+
+    """
+
+    return HTMLResponse(
+        html_page(
+            "Dashboard",
+            body,
+            "dashboard",
+            script
+        )
+    )
+
+
+# =========================================================
+# ANALYTICS PAGE
+# =========================================================
+
+def analytics_page(
+    title,
+    subtitle,
+    endpoint,
+    active,
+    chart_title
+):
+
+    body = f"""
+
+    <main class="container">
+
+        <div class="page">
+
+            <div class="page-title">
+
+                <div class="eyebrow">
+                    SHRIMP ANALYTICS
+                </div>
+
+                <h1>
+                    {title}
+                </h1>
+
+                <p>
+                    {subtitle}
+                </p>
+
+            </div>
+
+
+            <section class="kpi-grid">
+
+                <div class="kpi">
+
+                    <div class="kpi-label">
+                        กุ้งทั้งหมด
+                    </div>
+
+                    <div
+                        class="kpi-value"
+                        id="total"
+                    >
+                        0
+                    </div>
+
+                </div>
+
+
+                <div class="kpi">
+
+                    <div class="kpi-label">
+                        กุ้งเล็ก
+                    </div>
+
+                    <div
+                        class="kpi-value"
+                        id="small"
+                    >
+                        0
+                    </div>
+
+                </div>
+
+
+                <div class="kpi">
+
+                    <div class="kpi-label">
+                        กุ้งกลาง
+                    </div>
+
+                    <div
+                        class="kpi-value"
+                        id="medium"
+                    >
+                        0
+                    </div>
+
+                </div>
+
+
+                <div class="kpi">
+
+                    <div class="kpi-label">
+                        กุ้งใหญ่ + ป่วย
+                    </div>
+
+                    <div
+                        class="kpi-value"
+                        id="other"
+                    >
+                        0
+                    </div>
+
+                </div>
+
+            </section>
+
+
+            <section class="panel chart-panel">
+
+                <div class="section-head">
+
+                    <div>
+
+                        <h2>
+                            {chart_title}
+                        </h2>
+
+                        <div
+                            style="
+                            color:#8a96a1;
+                            font-size:13px;
+                            margin-top:6px;
+                            "
+                        >
+                            แสดงจำนวนกุ้งแยกตามประเภท
+                        </div>
+
+                    </div>
+
+                </div>
+
+
+                <div class="chart-box">
+
+                    <canvas id="barChart">
+                    </canvas>
+
+                </div>
+
+
+                <div class="chart-legend">
+
+                    <div class="legend-item">
+                        <span class="dot a"></span>
+                        กุ้งเล็ก
+                    </div>
+
+                    <div class="legend-item">
+                        <span class="dot b"></span>
+                        กุ้งกลาง
+                    </div>
+
+                    <div class="legend-item">
+                        <span class="dot c"></span>
+                        กุ้งใหญ่
+                    </div>
+
+                    <div class="legend-item">
+                        <span class="dot d"></span>
+                        กุ้งป่วย
+                    </div>
+
+                </div>
+
+            </section>
+
+
+            <section class="section">
+
+                <div class="section-head">
+
+                    <h2>
+                        ตารางสรุป
+                    </h2>
+
+                </div>
+
+
+                <div class="panel">
+
+                    <div class="table-wrap">
+
+                        <table>
+
+                            <thead>
+
+                                <tr>
+
+                                    <th>
+                                        ช่วงเวลา
+                                    </th>
+
+                                    <th>
+                                        กุ้งเล็ก
+                                    </th>
+
+                                    <th>
+                                        กุ้งกลาง
+                                    </th>
+
+                                    <th>
+                                        กุ้งใหญ่
+                                    </th>
+
+                                    <th>
+                                        กุ้งป่วย
+                                    </th>
+
+                                    <th>
+                                        รวม
+                                    </th>
+
+                                    <th>
+                                        รอบ
+                                    </th>
+
+                                </tr>
+
+                            </thead>
+
+                            <tbody id="tableBody">
+                            </tbody>
+
+                        </table>
+
+                    </div>
+
+                </div>
+
+            </section>
+
+        </div>
+
+    </main>
+    """
+
+
+    script = f"""
+
+    <script>
+
+    const ENDPOINT = "{endpoint}";
+
+    let chartData = [];
+
+
+    async function loadAnalytics() {
+
+        try {
+
+            const response =
+                await fetch(ENDPOINT);
+
+            const result =
+                await response.json();
+
+            chartData =
+                result.data || [];
+
+            updateSummary(chartData);
+
+            renderTable(chartData);
+
+            drawChart(chartData);
+
+        } catch (error) {
+
+            console.error(error);
+
+        }
+
     }
 
 
-    tbody.innerHTML =
-        history.map(row=>{
+    function updateSummary(data) {
+
+        let total = 0;
+        let small = 0;
+        let medium = 0;
+        let other = 0;
+
+        data.forEach(item => {
 
             const c =
-                row.counts || {};
+                item.counts || {{}};
+
+            small +=
+                Number(c["กุ้งเล็ก"] || 0);
+
+            medium +=
+                Number(c["กุ้งกลาง"] || 0);
+
+            other +=
+                Number(c["กุ้งใหญ่"] || 0);
+
+            other +=
+                Number(c["กุ้งป่วย"] || 0);
+
+            total +=
+                Number(item.total || 0);
+
+        });
+
+        document.getElementById("total")
+            .textContent = total;
+
+        document.getElementById("small")
+            .textContent = small;
+
+        document.getElementById("medium")
+            .textContent = medium;
+
+        document.getElementById("other")
+            .textContent = other;
+
+    }
 
 
-            return `
+    function renderTable(data) {
+
+        const body =
+            document.getElementById("tableBody");
+
+        body.innerHTML = "";
+
+        const rows =
+            data.slice().reverse();
+
+        if (rows.length === 0) {
+
+            body.innerHTML = `
+                <tr>
+                    <td
+                        colspan="7"
+                        style="
+                        text-align:center;
+                        padding:50px;
+                        color:#8a96a1;
+                        "
+                    >
+                        ยังไม่มีข้อมูล
+                    </td>
+                </tr>
+            `;
+
+            return;
+        }
+
+
+        rows.forEach(item => {
+
+            const c =
+                item.counts || {{}};
+
+            body.innerHTML += `
 
                 <tr>
 
                     <td>
-                        <span class="round-pill">
-                            #${escapeHtml(row.round_id)}
-                        </span>
-                    </td>
-
-                    <td>
                         <strong>
-                            ${number(row.total)}
+                            ${{item.label}}
                         </strong>
                     </td>
 
                     <td>
-                        ${number(c["กุ้งเล็ก"])}
+                        ${{c["กุ้งเล็ก"] || 0}}
                     </td>
 
                     <td>
-                        ${number(c["กุ้งกลาง"])}
+                        ${{c["กุ้งกลาง"] || 0}}
                     </td>
 
                     <td>
-                        ${number(c["กุ้งใหญ่"])}
+                        ${{c["กุ้งใหญ่"] || 0}}
                     </td>
 
                     <td>
-                        <span class="sick-pill">
-                            ${number(c["กุ้งป่วย"])}
-                        </span>
+                        ${{c["กุ้งป่วย"] || 0}}
                     </td>
 
                     <td>
-                        ${Number(row.avg_fps || 0).toFixed(1)}
+                        <strong>
+                            ${{item.total || 0}}
+                        </strong>
                     </td>
 
                     <td>
-                        ${escapeHtml(
-                            row.finished_at || "-"
-                        )}
+                        ${{item.rounds || 0}}
                     </td>
 
                 </tr>
 
             `;
 
-        }).join("");
+        });
 
-}
+    }
 
 
-// ======================================================
-// LOAD DATA
-// ======================================================
+    function drawChart(data) {
 
-async function loadData(){
+        const canvas =
+            document.getElementById("barChart");
 
-    try{
+        const ctx =
+            canvas.getContext("2d");
 
-        const response =
-            await fetch(
-                "/api/dashboard",
-                {
-                    cache:"no-store"
-                }
+        const rect =
+            canvas.getBoundingClientRect();
+
+        const dpr =
+            window.devicePixelRatio || 1;
+
+        canvas.width =
+            rect.width * dpr;
+
+        canvas.height =
+            rect.height * dpr;
+
+        ctx.scale(dpr, dpr);
+
+        const width =
+            rect.width;
+
+        const height =
+            rect.height;
+
+
+        ctx.clearRect(
+            0,
+            0,
+            width,
+            height
+        );
+
+
+        if (!data.length) {
+
+            ctx.fillStyle =
+                "#8a96a1";
+
+            ctx.font =
+                "15px Arial";
+
+            ctx.textAlign =
+                "center";
+
+            ctx.fillText(
+                "ยังไม่มีข้อมูลสำหรับแสดงกราฟ",
+                width / 2,
+                height / 2
+            );
+
+            return;
+
+        }
+
+
+        const padding = {{
+            left: 58,
+            right: 25,
+            top: 25,
+            bottom: 65
+        }};
+
+
+        const chartWidth =
+            width -
+            padding.left -
+            padding.right;
+
+        const chartHeight =
+            height -
+            padding.top -
+            padding.bottom;
+
+
+        let maxValue = 0;
+
+        data.forEach(item => {{
+
+            const c =
+                item.counts || {{}};
+
+            maxValue =
+                Math.max(
+                    maxValue,
+                    Number(c["กุ้งเล็ก"] || 0),
+                    Number(c["กุ้งกลาง"] || 0),
+                    Number(c["กุ้งใหญ่"] || 0),
+                    Number(c["กุ้งป่วย"] || 0)
+                );
+
+        }});
+
+
+        maxValue =
+            Math.ceil(
+                maxValue * 1.15
+            );
+
+        if (maxValue < 10) {
+            maxValue = 10;
+        }
+
+
+        // GRID
+
+        const gridCount = 5;
+
+        ctx.font =
+            "11px Arial";
+
+        ctx.textAlign =
+            "right";
+
+        for (
+            let i = 0;
+            i <= gridCount;
+            i++
+        ) {{
+
+            const value =
+                maxValue *
+                (i / gridCount);
+
+            const y =
+                padding.top +
+                chartHeight -
+                (
+                    value /
+                    maxValue
+                ) *
+                chartHeight;
+
+
+            ctx.strokeStyle =
+                "#edf0f3";
+
+            ctx.lineWidth = 1;
+
+            ctx.beginPath();
+
+            ctx.moveTo(
+                padding.left,
+                y
+            );
+
+            ctx.lineTo(
+                width - padding.right,
+                y
+            );
+
+            ctx.stroke();
+
+
+            ctx.fillStyle =
+                "#8b96a1";
+
+            ctx.fillText(
+                Math.round(value),
+                padding.left - 10,
+                y + 4
+            );
+
+        }}
+
+
+        const colors = [
+            "#8b9aaa",
+            "#4e6477",
+            "#1f3445",
+            "#d27b72"
+        ];
+
+
+        const keys = [
+            "กุ้งเล็ก",
+            "กุ้งกลาง",
+            "กุ้งใหญ่",
+            "กุ้งป่วย"
+        ];
+
+
+        const groupWidth =
+            chartWidth / data.length;
+
+        const barGap = 4;
+
+        const barWidth =
+            Math.max(
+                5,
+                (
+                    groupWidth * .68
+                    / keys.length
+                ) - barGap
             );
 
 
-        const data =
-            await response.json();
+        data.forEach(
+            (item, index) => {{
+
+                const centerX =
+                    padding.left +
+                    index * groupWidth +
+                    groupWidth / 2;
 
 
-        updateDashboard(data);
+                keys.forEach(
+                    (key, keyIndex) => {{
 
-        renderHistory(data.history);
+                        const value =
+                            Number(
+                                (
+                                    item.counts || {{}}
+                                )[key] || 0
+                            );
 
 
-    }catch(error){
+                        const barHeight =
+                            (
+                                value /
+                                maxValue
+                            ) *
+                            chartHeight;
 
-        console.error(error);
 
-        document.getElementById(
-            "lastUpdate"
-        ).textContent =
-            "เชื่อมต่อระบบไม่ได้";
+                        const x =
+                            centerX -
+                            (
+                                keys.length *
+                                (
+                                    barWidth +
+                                    barGap
+                                )
+                            ) / 2 +
+                            keyIndex *
+                            (
+                                barWidth +
+                                barGap
+                            );
+
+
+                        const y =
+                            padding.top +
+                            chartHeight -
+                            barHeight;
+
+
+                        ctx.fillStyle =
+                            colors[keyIndex];
+
+                        ctx.beginPath();
+
+                        ctx.roundRect(
+                            x,
+                            y,
+                            barWidth,
+                            barHeight,
+                            4
+                        );
+
+                        ctx.fill();
+
+
+                        if (
+                            data.length <= 15 &&
+                            value > 0
+                        ) {{
+
+                            ctx.fillStyle =
+                                "#56626e";
+
+                            ctx.font =
+                                "10px Arial";
+
+                            ctx.textAlign =
+                                "center";
+
+                            ctx.fillText(
+                                value,
+                                x +
+                                barWidth / 2,
+                                y - 5
+                            );
+
+                        }}
+
+                    }}
+                );
+
+
+                // X LABEL
+
+                ctx.fillStyle =
+                    "#7f8a95";
+
+                ctx.font =
+                    "11px Arial";
+
+                ctx.textAlign =
+                    "center";
+
+
+                let label =
+                    item.label;
+
+
+                if (
+                    data.length > 20 &&
+                    index % 2 !== 0
+                ) {{
+                    label = "";
+                }}
+
+
+                ctx.fillText(
+                    label,
+                    centerX,
+                    height - 25
+                );
+
+            }}
+        );
 
     }
 
-}
+
+    window.addEventListener(
+        "resize",
+        () => drawChart(chartData)
+    );
 
 
-// ======================================================
-// INITIAL
-// ======================================================
+    loadAnalytics();
 
-loadData();
+    setInterval(
+        loadAnalytics,
+        5000
+    );
 
+    </script>
 
-// Update every 3 seconds
-
-setInterval(
-    loadData,
-    3000
-);
+    """
 
 
-window.addEventListener(
-    "resize",
-    ()=>{
-        if(window.lastCounts){
-            drawDonut(window.lastCounts);
-        }
-    }
-);
-
-</script>
-
-
-</body>
-
-</html>
-"""
+    return HTMLResponse(
+        html_page(
+            title,
+            body,
+            active,
+            script
+        )
+    )
 
 
 # =========================================================
-# LIVE HTML
+# DAILY PAGE
 # =========================================================
 
-LIVE_HTML = HTML.replace(
+@app.get("/daily", response_class=HTMLResponse)
+async def daily_page():
 
-    '<main class="container">',
-
-    r'''
-<main class="container">
-
-<section class="hero" style="margin-bottom:20px">
-
-    <div class="hero-content">
-
-        <div class="hero-kicker">
-            ✦ REAL-TIME AI VISION
-        </div>
-
-        <h2>
-            กล้องตรวจสอบ<br>
-            Real-time
-        </h2>
-
-        <p>
-            ดูภาพจากกล้อง AI พร้อมสถานะระบบ
-            และผลการตรวจจับล่าสุดแบบเรียลไทม์
-        </p>
-
-    </div>
-
-</section>
+    return analytics_page(
+        "สรุปรายวัน",
+        "วิเคราะห์จำนวนกุ้งที่ตรวจพบในแต่ละวัน",
+        "/api/analytics/daily",
+        "daily",
+        "แผนภูมิแท่งรายวัน"
+    )
 
 
-<section class="live-layout">
+# =========================================================
+# MONTHLY PAGE
+# =========================================================
+
+@app.get("/monthly", response_class=HTMLResponse)
+async def monthly_page():
+
+    return analytics_page(
+        "สรุปรายเดือน",
+        "วิเคราะห์จำนวนกุ้งที่ตรวจพบในแต่ละเดือน",
+        "/api/analytics/monthly",
+        "monthly",
+        "แผนภูมิแท่งรายเดือน"
+    )
 
 
-    <div class="camera">
+# =========================================================
+# YEARLY PAGE
+# =========================================================
 
-        <img
-            id="liveImage"
-            src="/api/live/frame"
-            onerror="this.style.display='none'"
-        >
+@app.get("/yearly", response_class=HTMLResponse)
+async def yearly_page():
+
+    return analytics_page(
+        "สรุปรายปี",
+        "วิเคราะห์จำนวนกุ้งที่ตรวจพบในแต่ละปี",
+        "/api/analytics/yearly",
+        "yearly",
+        "แผนภูมิแท่งรายปี"
+    )
 
 
-        <div
-            class="no-camera"
-            id="noCamera"
-        >
+# =========================================================
+# LIVE CAMERA PAGE
+# =========================================================
 
-            <div>
+@app.get("/live", response_class=HTMLResponse)
+async def live_page():
 
-                <div class="no-camera-icon">
-                    📷
+    body = """
+
+    <main class="container">
+
+        <div class="page">
+
+            <div class="page-title">
+
+                <div class="eyebrow">
+                    REAL-TIME MONITORING
                 </div>
 
-                <strong>
-                    กำลังรอสัญญาณจาก AI
-                </strong>
+                <h1>
+                    กล้อง Live
+                </h1>
 
                 <p>
-                    เมื่อกล้องเริ่มส่งข้อมูล
-                    ภาพจะแสดงที่นี่อัตโนมัติ
+                    ตรวจสอบภาพจากกล้องและสถานะ AI
+                    แบบ Real-time
                 </p>
 
             </div>
 
-        </div>
 
+            <section class="camera-panel">
 
-        <div class="camera-overlay">
-
-            <div class="camera-status">
-
-                <span class="live-dot"></span>
-
-                LIVE AI CAMERA
-
-            </div>
-
-
-            <div
-                class="camera-status"
-                id="cameraTime"
-            >
-                —
-            </div>
-
-        </div>
-
-    </div>
-
-
-
-    <div class="live-side">
-
-
-        <div class="panel">
-
-            <div class="panel-head">
-
-                <h3>
-                    Camera Status
-                </h3>
-
-            </div>
-
-
-            <div class="summary-number"
-                 id="liveFps">
-
-                —
-
-            </div>
-
-            <div class="summary-label">
-                FPS ของรอบล่าสุด
-            </div>
-
-        </div>
-
-
-
-        <div class="panel">
-
-            <div class="panel-head">
-
-                <h3>
-                    รอบล่าสุด
-                </h3>
-
-                <span
-                    class="round-id"
-                    id="liveRound"
+                <div
+                    class="camera-screen"
+                    id="cameraScreen"
                 >
-                    —
-                </span>
 
-            </div>
+                    <img
+                        id="camera"
+                        src="/api/live/frame"
+                        alt="Live Camera"
+                    >
+
+                    <div
+                        class="camera-empty"
+                        id="empty"
+                        style="display:none"
+                    >
+                        <div
+                            style="
+                            font-size:40px;
+                            margin-bottom:10px;
+                            "
+                        >
+                            📷
+                        </div>
+
+                        ไม่พบสัญญาณจากกล้อง
+
+                    </div>
+
+                </div>
 
 
-            <div class="summary-number"
-                 id="liveTotal">
+                <div class="camera-status">
 
-                0
+                    <div
+                        class="status"
+                        id="status"
+                    >
 
-            </div>
+                        <span
+                            class="status-dot"
+                        ></span>
 
-            <div class="summary-label">
-                กุ้งทั้งหมด
-            </div>
+                        <span id="statusText">
+                            กำลังตรวจสอบ...
+                        </span>
+
+                    </div>
 
 
-            <div class="summary-grid">
+                    <div>
+                        FPS:
+                        <strong id="fps">
+                            0
+                        </strong>
+                    </div>
+
+                </div>
+
+            </section>
 
 
-                <div class="mini">
+            <section class="live-stats">
 
-                    <label>
-                        กุ้งเล็ก
-                    </label>
+                <div class="live-stat">
 
-                    <strong id="liveSmall">
+                    <span>
+                        สถานะระบบ
+                    </span>
+
+                    <strong id="systemStatus">
+                        -
+                    </strong>
+
+                </div>
+
+
+                <div class="live-stat">
+
+                    <span>
+                        FPS
+                    </span>
+
+                    <strong id="fps2">
                         0
                     </strong>
 
                 </div>
 
 
-                <div class="mini">
+                <div class="live-stat">
 
-                    <label>
-                        กุ้งกลาง
-                    </label>
+                    <span>
+                        อัปเดตล่าสุด
+                    </span>
 
-                    <strong id="liveMedium">
-                        0
+                    <strong
+                        id="lastUpdate"
+                        style="font-size:15px"
+                    >
+                        -
                     </strong>
 
                 </div>
 
-
-                <div class="mini">
-
-                    <label>
-                        กุ้งใหญ่
-                    </label>
-
-                    <strong id="liveLarge">
-                        0
-                    </strong>
-
-                </div>
-
-
-                <div class="mini">
-
-                    <label>
-                        กุ้งป่วย
-                    </label>
-
-                    <strong id="liveSick">
-                        0
-                    </strong>
-
-                </div>
-
-
-            </div>
+            </section>
 
         </div>
 
-
-        <a
-            href="/"
-            class="hero-button"
-            style="
-                text-align:center;
-                display:block;
-            "
-        >
-            ← กลับ Dashboard
-        </a>
+    </main>
+    """
 
 
-    </div>
+    script = """
+
+    <script>
+
+    const camera =
+        document.getElementById("camera");
+
+    const empty =
+        document.getElementById("empty");
 
 
-</section>
+    async function updateStatus() {
 
+        try {
 
-<div class="footer">
-
-    SHRIMP VISION AI · REAL-TIME MONITORING
-
-</div>
-'''
-)
-
-
-# =========================================================
-# LIVE SCRIPT
-# =========================================================
-
-LIVE_SCRIPT = r"""
-
-<script>
-
-let lastFrame = 0;
-
-
-function number(n){
-
-    return Number(n || 0).toLocaleString("th-TH");
-
-}
-
-
-async function updateLive(){
-
-    try{
-
-        const status =
-            await fetch(
-                "/api/live/status",
-                {cache:"no-store"}
-            );
-
-        const s =
-            await status.json();
-
-
-        const img =
-            document.getElementById(
-                "liveImage"
-            );
-
-        const empty =
-            document.getElementById(
-                "noCamera"
-            );
-
-
-        if(s.online){
-
-            img.style.display="block";
-
-            empty.style.display="none";
-
-            img.src =
-                "/api/live/frame?t="
-                + Date.now();
-
-            document.getElementById(
-                "cameraTime"
-            ).textContent =
-                new Date().toLocaleTimeString(
-                    "th-TH"
+            const response =
+                await fetch(
+                    "/api/live/status",
+                    {
+                        cache: "no-store"
+                    }
                 );
 
-        }else{
-
-            img.style.display="none";
-
-            empty.style.display="grid";
-
-        }
+            const data =
+                await response.json();
 
 
-        const data =
-            await fetch(
-                "/api/dashboard",
-                {cache:"no-store"}
-            );
+            const online =
+                data.status === "online";
 
 
-        const dashboard =
-            await data.json();
+            const status =
+                document.getElementById("status");
 
 
-        const latest =
-            dashboard.latest;
-
-
-        if(latest){
-
-            const c =
-                latest.counts || {};
+            status.className =
+                online
+                ? "status online"
+                : "status";
 
 
             document.getElementById(
-                "liveFps"
+                "statusText"
+            ).textContent =
+                online
+                ? "AI Camera Online"
+                : "Camera Offline";
+
+
+            document.getElementById(
+                "systemStatus"
+            ).textContent =
+                online
+                ? "Online"
+                : "Offline";
+
+
+            document.getElementById(
+                "fps"
             ).textContent =
                 Number(
-                    latest.avg_fps || 0
+                    data.fps || 0
                 ).toFixed(1);
 
 
             document.getElementById(
-                "liveRound"
+                "fps2"
             ).textContent =
-                "ROUND " +
-                (latest.round_id ?? "—");
+                Number(
+                    data.fps || 0
+                ).toFixed(1);
 
 
             document.getElementById(
-                "liveTotal"
+                "lastUpdate"
             ).textContent =
-                number(latest.total);
+                data.last_update
+                ? new Date(
+                    data.last_update
+                ).toLocaleString("th-TH")
+                : "-";
 
 
-            document.getElementById(
-                "liveSmall"
-            ).textContent =
-                number(c["กุ้งเล็ก"]);
+            if (!online) {
 
+                empty.style.display =
+                    "block";
 
-            document.getElementById(
-                "liveMedium"
-            ).textContent =
-                number(c["กุ้งกลาง"]);
+                camera.style.display =
+                    "none";
 
+            } else {
 
-            document.getElementById(
-                "liveLarge"
-            ).textContent =
-                number(c["กุ้งใหญ่"]);
+                empty.style.display =
+                    "none";
 
+                camera.style.display =
+                    "block";
 
-            document.getElementById(
-                "liveSick"
-            ).textContent =
-                number(c["กุ้งป่วย"]);
+            }
+
+        } catch (error) {
+
+            console.error(error);
 
         }
-
-
-    }catch(error){
-
-        console.error(error);
 
     }
 
-}
+
+    function refreshCamera() {
+
+        const current =
+            camera.src.split("?")[0];
+
+        camera.src =
+            current +
+            "?t=" +
+            Date.now();
+
+    }
 
 
-updateLive();
+    setInterval(
+        updateStatus,
+        1500
+    );
 
-setInterval(
-    updateLive,
-    1500
-);
-
-</script>
-
-"""
-
-
-LIVE_HTML = LIVE_HTML.replace(
-    "</body>",
-    LIVE_SCRIPT + "</body>"
-)
+    setInterval(
+        refreshCamera,
+        300
+    );
 
 
-# =========================================================
-# ROUTES
-# =========================================================
+    updateStatus();
 
-@app.get("/", response_class=HTMLResponse)
-def home():
+    </script>
+
+    """
+
 
     return HTMLResponse(
-        content=HTML,
-        headers={
-            "Cache-Control":"no-store"
-        }
-    )
-
-
-@app.get("/live", response_class=HTMLResponse)
-def live():
-
-    return HTMLResponse(
-        content=LIVE_HTML,
-        headers={
-            "Cache-Control":"no-store"
-        }
+        html_page(
+            "Live Camera",
+            body,
+            "live",
+            script
+        )
     )
 
 
 # =========================================================
-# START
+# HEALTH CHECK
+# =========================================================
+
+@app.get("/api/health")
+async def health():
+
+    return {
+        "status": "ok",
+        "rounds": len(round_history),
+        "camera": live_info["status"],
+    }
+
+
+# =========================================================
+# RUN
 # =========================================================
 
 if __name__ == "__main__":
 
-    import uvicorn
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            8000
-        )
-    )
-
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=port
+        port=PORT
     )
